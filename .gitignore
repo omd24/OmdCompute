@@ -1,0 +1,50 @@
+# Private notes and per-machine settings - not tracked
+/local/
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Build output
+build/
+bin/
+out/
+*.obj
+*.pdb
+*.ilk
+*.exe
+
+# Visual Studio / VS Code
+.vs/
+*.vcxproj.user
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ML artefacts and data (document download/regeneration instead)
+data/
+datasets/
+checkpoints/
+runs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tflite
+*.safetensors
+
+# Android
+.gradle/
+local.properties
+*.apk
+*.aab
+.cxx/
+.externalNativeBuild/
+
+# Profiler captures and logs
+*.nsys-rep
+*.ncu-rep
+*.log
