@@ -1,0 +1,28 @@
+{
+  "seed": 1234,
+  "sizes": [[256, 256], [257, 129]],
+
+  "patterns": {
+    "gradient":     {},
+    "diagonal_gradient": {},
+    "step_edge":    {},
+    "checkerboard": { "cell": 8 },
+    "flat":         { "value": 0.5 },
+    "zone_plate":   { "max_frequency": 0.5 }
+  },
+
+  "noise": { "model": "gaussian", "sigmas": [0.02, 0.05, 0.1, 0.2], "clip": false },
+
+  "filters": {
+    "identity": {},
+    "gaussian": {
+      "sigmas": [0.5, 1.0, 2.0, 4.0],
+      "truncate": 3.0,
+      "boundary": "clamp",
+      "implementations": ["direct", "separable"]
+    }
+  },
+
+  "metrics": { "peak": 1.0 },
+  "output_dir": "results/default"
+}

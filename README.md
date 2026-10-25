@@ -10,7 +10,7 @@ Each experiment is a bounded, self-contained investigation with a stated questio
 
 | # | Experiment | Status |
 |---|---|---|
-| 00 | [Image baseline](experiments/pc/00-image-baseline/) — CPU reference filters and metrics | Not started |
+| 00 | [Image baseline](experiments/pc/00-image-baseline/) — CPU reference filters and metrics | In progress |
 | 01 | [CUDA filtering](experiments/pc/01-cuda-filtering/) — correctness and profiler-guided optimisation | Not started |
 | 02 | [Neural denoising](experiments/pc/02-neural-denoising/) — compact residual CNN in PyTorch | Not started |
 | 03 | [Reconstruction](experiments/pc/03-reconstruction/) — temporal reconstruction or learned upscaling | Not started |

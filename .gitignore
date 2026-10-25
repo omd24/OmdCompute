@@ -3,6 +3,9 @@
 CLAUDE.local.md
 .claude/settings.local.json
 
+# Generated experiment output (selected figures are copied to a tracked figures/ folder)
+results/
+
 # Build output
 build/
 bin/
