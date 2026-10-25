@@ -23,10 +23,26 @@ $u \in [0, W-1]$: column, $v \in [0, H-1]$: row. Values are linear intensities i
 
 Zone plate: $r$ is the distance from the centre $\left(\frac{W-1}{2}, \frac{H-1}{2}\right)$, $r_{max}$ the centre-to-corner distance; local frequency $f(r) = \alpha r / \pi$ cycles/pixel.
 
+## Noise
+
+$$y = x + \sigma_n z, \qquad z[v,u] \sim \mathcal{N}(0, 1) \ \text{i.i.d.}$$
+
+- $z$: one standard-normal field per image size, generator seeded with $(\text{seed}, W, H)$; shared across patterns and $\sigma_n$.
+- $y$ is not clipped, so $\mathbb{E}[y - x] = 0$ at every pixel.
+
+| Pattern | Clean | $\sigma_n = 0.05$ | $\sigma_n = 0.2$ |
+|---|---|---|---|
+| `step_edge` | <img src="figures/noise/step_edge.png" width="96"> | <img src="figures/noise/step_edge_n0.05.png" width="96"> | <img src="figures/noise/step_edge_n0.2.png" width="96"> |
+| `zone_plate` | <img src="figures/noise/zone_plate.png" width="96"> | <img src="figures/noise/zone_plate_n0.05.png" width="96"> | <img src="figures/noise/zone_plate_n0.2.png" width="96"> |
+
+**Note:** only the PNG previews are clipped to $[0, 1]$; all computations use the unclipped values.
+
 ## Configuration
 
 | Key | Example | Meaning |
 |---|---|---|
+| `seed` | `1234` | Base seed of the noise generator |
 | `sizes` | `[[256, 256], [257, 129]]` | Image sizes $[W, H]$ |
 | `patterns` | `{"checkerboard": {"cell": 8}}` | Patterns to generate and their parameters ($k$ = `cell`, $c$ = `value`, $f_{max}$ = `max_frequency`) |
+| `noise.sigmas` | `[0.02, 0.05, 0.1, 0.2]` | Noise standard deviations $\sigma_n$ |
 | `output_dir` | `"results/default"` | Output folder, relative to this directory |
