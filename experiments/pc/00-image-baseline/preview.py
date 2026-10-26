@@ -14,3 +14,11 @@ def linear_to_srgb(x):
 def save_png(path, x):
     img8 = np.round(linear_to_srgb(x) * 255).astype(np.uint8)
     Image.fromarray(img8).save(path)             # H×W uint8 to greyscale PNG
+
+def save_error_png(path, e, scale):
+    t = np.clip(e / scale, -1.0, 1.0)            # error relative to scale [-1, 1]
+    r = np.where(t > 0, 1.0, 1.0 + t)            # fades out for negative errors
+    g = 1.0 - np.abs(t)                          # white at 0, fades with |error|
+    b = np.where(t < 0, 1.0, 1.0 - t)            # fades out for positive errors
+    rgb = np.stack([r, g, b], axis=-1)           # HxWx3colour image
+    Image.fromarray(np.round(rgb * 255).astype(np.uint8)).save(path)

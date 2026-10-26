@@ -78,13 +78,63 @@ for each pixel (v, u):                  for each tap (j, i):
 
 Each row is one tap applied to every pixel; each column is one pixel's neighbourhood. The per-tap order turns the inner loop into a single vectorised NumPy array operation, leaving only $(2R+1)^2$ (or $2(2R+1)$) interpreted iterations instead of one per pixel and tap.
 
-### Results ($\sigma_n = 0.1$)
+### Results
+
+$\sigma_n = 0.1$, 256×256.
 
 | Pattern | Noisy | $\sigma = 1$ | $\sigma = 2$ | $\sigma = 4$ |
 |---|---|---|---|---|
 | `step_edge` | <img src="figures/filters/step_edge_n0.1.png" width="96"> | <img src="figures/filters/step_edge_n0.1_s1.0.png" width="96"> | <img src="figures/filters/step_edge_n0.1_s2.0.png" width="96"> | <img src="figures/filters/step_edge_n0.1_s4.0.png" width="96"> |
 | `checkerboard` | <img src="figures/filters/checkerboard_n0.1.png" width="96"> | <img src="figures/filters/checkerboard_n0.1_s1.0.png" width="96"> | <img src="figures/filters/checkerboard_n0.1_s2.0.png" width="96"> | <img src="figures/filters/checkerboard_n0.1_s4.0.png" width="96"> |
 | `zone_plate` | <img src="figures/filters/zone_plate_n0.1.png" width="96"> | <img src="figures/filters/zone_plate_n0.1_s1.0.png" width="96"> | <img src="figures/filters/zone_plate_n0.1_s2.0.png" width="96"> | <img src="figures/filters/zone_plate_n0.1_s4.0.png" width="96"> |
+
+## Metrics
+
+$$\text{MSE} = \frac{1}{HW}\sum_{v,u}\big(\hat{x}[v,u] - x[v,u]\big)^2, \qquad \text{PSNR} = 10\log_{10}\frac{\text{peak}^2}{\text{MSE}}\ \ \text{[dB]}, \qquad \text{PSNR} = \infty \text{ if MSE} = 0$$
+
+peak $= 1$ (linear $[0, 1]$ data). $+6$ dB $\approx$ RMS error halved.
+
+All results: `results/<config>/metrics.csv` (pattern, size, $\sigma_n$, filter, MSE, PSNR).
+
+### Noise-only check
+
+`flat`, 256×256, $\sigma_n = 0.1$. Zero bias, so $\text{MSE} = \sigma_n^2 \left(\sum_i w_i^2\right)^2$ (interior; clamped borders average fewer independent samples, hence slightly higher measured values).
+
+| Filter | MSE measured | MSE expected | PSNR [dB] |
+|---|---|---|---|
+| `no_filter` | 9.995e-3 | 1.000e-2 | 20.00 |
+| Gaussian $\sigma = 0.5$ | 4.134e-3 | 4.113e-3 | 23.84 |
+| Gaussian $\sigma = 1$ | 8.113e-4 | 7.968e-4 | 30.91 |
+| Gaussian $\sigma = 2$ | 2.043e-4 | 1.998e-4 | 36.90 |
+| Gaussian $\sigma = 4$ | 5.370e-5 | 5.008e-5 | 42.70 |
+
+### PSNR by pattern
+
+PSNR [dB], 256×256, $\sigma_n = 0.1$.
+
+| Pattern | `no_filter` | $\sigma = 0.5$ | $\sigma = 1$ | $\sigma = 2$ | $\sigma = 4$ |
+|---|---|---|---|---|---|
+| `gradient` | 20.00 | 23.84 | 30.91 | 36.90 | **42.69** |
+| `diagonal_gradient` | 20.00 | 23.84 | 30.91 | 36.89 | **42.65** |
+| `flat` | 20.00 | 23.84 | 30.91 | 36.90 | **42.70** |
+| `step_edge` | 20.00 | 23.75 | **28.12** | 27.09 | 24.34 |
+| `checkerboard` ($k = 8$) | **20.00** | 19.83 | 13.21 | 9.60 | 6.62 |
+| `zone_plate` | **20.00** | 18.42 | 11.57 | 9.58 | 9.16 |
+
+Bold: best filter per pattern. Detail-free patterns improve monotonically with $\sigma$; patterns with edges or fine detail have an optimum (or none) where blur bias exceeds the noise reduction.
+
+### Error maps
+
+$\hat{x} - x$, 256×256, $\sigma_n = 0.1$. Blue: $\hat{x} < x$, white: $\hat{x} = x$, red: $\hat{x} > x$; full colour at $|\hat{x} - x| \ge \sigma_n$.
+
+| Pattern | `no_filter` | $\sigma = 1$ | $\sigma = 2$ | $\sigma = 4$ |
+|---|---|---|---|---|
+| `step_edge` | <img src="figures/metrics/step_edge_n0.1_none_err.png" width="96"> | <img src="figures/metrics/step_edge_n0.1_s1.0_err.png" width="96"> | <img src="figures/metrics/step_edge_n0.1_s2.0_err.png" width="96"> | <img src="figures/metrics/step_edge_n0.1_s4.0_err.png" width="96"> |
+| `checkerboard` | <img src="figures/metrics/checkerboard_n0.1_none_err.png" width="96"> | <img src="figures/metrics/checkerboard_n0.1_s1.0_err.png" width="96"> | <img src="figures/metrics/checkerboard_n0.1_s2.0_err.png" width="96"> | <img src="figures/metrics/checkerboard_n0.1_s4.0_err.png" width="96"> |
+
+### Environment
+
+CPU only: AMD Ryzen 9 9955HX3D, Windows 11, Python 3.13.5, NumPy 2.5.2, float64.
 
 ## Configuration
 
@@ -98,4 +148,5 @@ Each row is one tap applied to every pixel; each column is one pixel's neighbour
 | `filters.gaussian.sigmas` | `[0.5, 1.0, 2.0, 4.0]` | Blur standard deviations $\sigma$ |
 | `filters.gaussian.truncate` | `3.0` | Kernel radius $R = \lceil \text{truncate} \cdot \sigma \rceil$ |
 | `filters.gaussian.implementations` | `["direct", "separable"]` | Gaussian variants to run |
+| `metrics.peak` | `1.0` | Peak value in PSNR |
 | `output_dir` | `"results/default"` | Output folder, relative to this directory |
