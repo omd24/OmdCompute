@@ -19,6 +19,7 @@ out/
 .vs/
 *.vcxproj.user
 .vscode/
+*.code-workspace
 
 # Python
 __pycache__/

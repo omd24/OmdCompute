@@ -37,6 +37,55 @@ $$y = x + \sigma_n z, \qquad z[v,u] \sim \mathcal{N}(0, 1) \ \text{i.i.d.}$$
 
 **Note:** only the PNG previews are clipped to $[0, 1]$; all computations use the unclipped values.
 
+## Filters
+
+| Filter | Definition |
+|---|---|
+| `no_filter` | $\hat{x} = y$ |
+| `gaussian_direct` | $\hat{x}[v,u] = \sum\limits_{j=-R}^{R}\sum\limits_{i=-R}^{R} w_j\, w_i\; y\big[c_v(v+j),\, c_u(u+i)\big]$ |
+| `gaussian_separable` | $t[v,u] = \sum\limits_{i} w_i\, y\big[v,\, c_u(u+i)\big], \qquad \hat{x}[v,u] = \sum\limits_{j} w_j\, t\big[c_v(v+j),\, u\big]$ |
+
+Kernel and boundary:
+
+$$w_i = \frac{e^{-i^2/2\sigma^2}}{\sum_{k=-R}^{R} e^{-k^2/2\sigma^2}}, \qquad R = \lceil 3\sigma \rceil, \qquad c_u(u) = \min(\max(u, 0), W-1)$$
+
+| | Taps per pixel | $\sigma = 4$ |
+|---|---|---|
+| Direct | $(2R+1)^2$ | 625 |
+| Separable | $2(2R+1)$ | 50 |
+
+Direct and separable agree to $\max|\Delta| = 3.1 \times 10^{-15}$ (float64 rounding) for both image sizes and all $\sigma$.
+
+### Evaluation order
+
+Both orders compute the same sum.
+
+```
+Per pixel (pixel shader)                Per tap (this implementation)
+for each pixel (v, u):                  for each tap (j, i):
+    for each tap (j, i):                    out += w[j,i] * shift(y_padded, j, i)   ← whole H×W image
+        out[v,u] += w[j,i] * y[v+j, u+i]
+```
+
+1D example, $w = [0.25, 0.5, 0.25]$, clamped border:
+
+| | $u=0$ | $u=1$ | $u=2$ | $u=3$ | $u=4$ |
+|---|---|---|---|---|---|
+| $y$ shifted by $-1$ | 1 | 1 | 2 | 3 | 4 |
+| $y$ | 1 | 2 | 3 | 4 | 5 |
+| $y$ shifted by $+1$ | 2 | 3 | 4 | 5 | 5 |
+| $\hat{x}$ (weighted column sum) | 1.25 | 2.0 | 3.0 | 4.0 | 4.75 |
+
+Each row is one tap applied to every pixel; each column is one pixel's neighbourhood. The per-tap order turns the inner loop into a single vectorised NumPy array operation, leaving only $(2R+1)^2$ (or $2(2R+1)$) interpreted iterations instead of one per pixel and tap.
+
+### Results ($\sigma_n = 0.1$)
+
+| Pattern | Noisy | $\sigma = 1$ | $\sigma = 2$ | $\sigma = 4$ |
+|---|---|---|---|---|
+| `step_edge` | <img src="figures/filters/step_edge_n0.1.png" width="96"> | <img src="figures/filters/step_edge_n0.1_s1.0.png" width="96"> | <img src="figures/filters/step_edge_n0.1_s2.0.png" width="96"> | <img src="figures/filters/step_edge_n0.1_s4.0.png" width="96"> |
+| `checkerboard` | <img src="figures/filters/checkerboard_n0.1.png" width="96"> | <img src="figures/filters/checkerboard_n0.1_s1.0.png" width="96"> | <img src="figures/filters/checkerboard_n0.1_s2.0.png" width="96"> | <img src="figures/filters/checkerboard_n0.1_s4.0.png" width="96"> |
+| `zone_plate` | <img src="figures/filters/zone_plate_n0.1.png" width="96"> | <img src="figures/filters/zone_plate_n0.1_s1.0.png" width="96"> | <img src="figures/filters/zone_plate_n0.1_s2.0.png" width="96"> | <img src="figures/filters/zone_plate_n0.1_s4.0.png" width="96"> |
+
 ## Configuration
 
 | Key | Example | Meaning |
@@ -45,4 +94,8 @@ $$y = x + \sigma_n z, \qquad z[v,u] \sim \mathcal{N}(0, 1) \ \text{i.i.d.}$$
 | `sizes` | `[[256, 256], [257, 129]]` | Image sizes $[W, H]$ |
 | `patterns` | `{"checkerboard": {"cell": 8}}` | Patterns to generate and their parameters ($k$ = `cell`, $c$ = `value`, $f_{max}$ = `max_frequency`) |
 | `noise.sigmas` | `[0.02, 0.05, 0.1, 0.2]` | Noise standard deviations $\sigma_n$ |
+| `filters.no_filter` | `{}` | Include the unfiltered baseline |
+| `filters.gaussian.sigmas` | `[0.5, 1.0, 2.0, 4.0]` | Blur standard deviations $\sigma$ |
+| `filters.gaussian.truncate` | `3.0` | Kernel radius $R = \lceil \text{truncate} \cdot \sigma \rceil$ |
+| `filters.gaussian.implementations` | `["direct", "separable"]` | Gaussian variants to run |
 | `output_dir` | `"results/default"` | Output folder, relative to this directory |
