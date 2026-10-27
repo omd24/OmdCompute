@@ -24,5 +24,6 @@
   },
 
   "metrics": { "peak": 1.0 },
-  "output_dir": "results/default"
+  "output_dir": "results/default",
+  "export_npy": { "patterns": ["step_edge", "zone_plate"], "sigmas_n": [0.1] }
 }

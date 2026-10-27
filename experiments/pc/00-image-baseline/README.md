@@ -1,11 +1,25 @@
 # 00 — Image baseline
 
-**Track:** PC series (M0) · **Status:** In progress
+**Track:** PC series (M0) · **Status:** Done
 
-Procedural test images with exact ground truth, used as the reference for the filtering and denoising experiments.
+Procedural test images with exact ground truth, additive Gaussian noise, classical Gaussian denoising filters and error metrics, as a CPU float64 reference.
+
+```mermaid
+flowchart LR
+    C["config"] --> X["pattern x"]
+    X --> Y["noisy y = x + σn·z"]
+    Y --> F["filters → x̂"]
+    F --> M["MSE / PSNR"]
+    M --> O1["metrics.csv, sweep plots"]
+    F --> O2["previews, error maps"]
+    Y --> O3["float64 .npy exports"]
+    F --> O3
+```
 
 ```bash
-python run.py --config configs/default.json
+python -m pip install numpy pillow matplotlib pytest
+python run.py --config configs/default.json     # outputs → results/<output_dir>/
+python -m pytest                                # correctness tests
 ```
 
 ## Test patterns
@@ -132,9 +146,57 @@ $\hat{x} - x$, 256×256, $\sigma_n = 0.1$. Blue: $\hat{x} < x$, white: $\hat{x} 
 | `step_edge` | <img src="figures/metrics/step_edge_n0.1_none_err.png" width="96"> | <img src="figures/metrics/step_edge_n0.1_s1.0_err.png" width="96"> | <img src="figures/metrics/step_edge_n0.1_s2.0_err.png" width="96"> | <img src="figures/metrics/step_edge_n0.1_s4.0_err.png" width="96"> |
 | `checkerboard` | <img src="figures/metrics/checkerboard_n0.1_none_err.png" width="96"> | <img src="figures/metrics/checkerboard_n0.1_s1.0_err.png" width="96"> | <img src="figures/metrics/checkerboard_n0.1_s2.0_err.png" width="96"> | <img src="figures/metrics/checkerboard_n0.1_s4.0_err.png" width="96"> |
 
-### Environment
+### PSNR sweep
 
-CPU only: AMD Ryzen 9 9955HX3D, Windows 11, Python 3.13.5, NumPy 2.5.2, float64.
+PSNR [dB] versus blur $\sigma$ ($\sigma = 0$: `no_filter`), one curve per $\sigma_n$, 256×256.
+
+<img src="figures/sweep/sweep_256x256.png" width="720">
+
+## Tests
+
+| Test | Property | Tolerance |
+|---|---|---|
+| `kernel_normalised_and_symmetric` | $\sum w_i = 1,\ w_{-i} = w_i$ | $10^{-12}$ |
+| `separable_equals_direct` | direct = separable, both sizes, all $\sigma$ | $10^{-12}$ |
+| `flat_is_unchanged` | $G_\sigma * c = c$ | $10^{-12}$ |
+| `ramp_interior_is_preserved` | linear input unchanged beyond $R$ from the border | $10^{-12}$ |
+| `flat_noise_mse_matches_theory` | interior MSE $= \sigma_n^2 (\sum w_i^2)^2$ | 10 % (finite-sample estimate) |
+| `psnr_values` | PSNR$(x, x) = \infty$; RMS 0.1 → 20 dB | $10^{-9}$ |
+| `noise_is_reproducible` | same seed → identical $z$; different seed → different $z$ | exact |
+
+## Outputs
+
+```
+results/<output_dir>/
+  config.json                    copy of the configuration used
+  metrics.csv                    one row per (pattern, size, σn, filter)
+  sweep_<W>x<H>.png
+  images/<pattern>/              previews and error maps (8-bit sRGB)
+  npy/<pattern>/                 float64 arrays: x, y, x̂ per filter (subset, see export_npy)
+```
+
+## Discussion
+
+| Observation | Figure | Interpretation |
+|---|---|---|
+| `flat` and gradient curves rise with $\sigma$ | <a href="figures/sweep/panel_flat.png"><img src="figures/sweep/panel_flat.png" width="140"></a> | No structure to lose; blur only removes noise |
+| `step_edge` rises, then falls | <a href="figures/sweep/panel_step_edge.png"><img src="figures/sweep/panel_step_edge.png" width="140"></a> | Light blur removes noise; strong blur smears the edge. Best $\sigma$: 0.5, 1, 1, 2 for $\sigma_n$ = 0.02, 0.05, 0.1, 0.2 |
+| `checkerboard`, `zone_plate` fall; curves merge at large $\sigma$ | <a href="figures/sweep/panel_checkerboard.png"><img src="figures/sweep/panel_checkerboard.png" width="140"></a> | Blur destroys the small repeating structure; once destroyed, the noise level no longer matters |
+| Error band at the step widens with $\sigma$ | <a href="figures/metrics/step_edge_n0.1_s4.0_err.png"><img src="figures/metrics/step_edge_n0.1_s4.0_err.png" width="96"></a> | The smeared edge is the cost of blurring |
+| Lighter cells along the image border | <a href="figures/metrics/checkerboard_n0.1_s2.0_err.png"><img src="figures/metrics/checkerboard_n0.1_s2.0_err.png" width="96"></a> | Clamping repeats border pixels, so less averaging happens there |
+
+One blur strength cannot suit both flat areas (strong blur preferred) and edges or fine detail (little blur preferred). A filter that reduces blurring near edges, or learns where to blur, addresses this.
+
+## Limitations
+
+- Synthetic greyscale patterns only; no natural images or colour.
+- I.i.d. additive Gaussian noise; signal-dependent and rendering (Monte Carlo) noise are not modelled.
+- PSNR/MSE only; no perceptual metric.
+- Clamp boundary only.
+
+## Environment
+
+CPU only: AMD Ryzen 9 9955HX3D, Windows 11, Python 3.13.5, NumPy 2.5.2, Pillow 12.3.0, Matplotlib 3.11.2, pytest 9.1.1; float64.
 
 ## Configuration
 
@@ -149,4 +211,5 @@ CPU only: AMD Ryzen 9 9955HX3D, Windows 11, Python 3.13.5, NumPy 2.5.2, float64.
 | `filters.gaussian.truncate` | `3.0` | Kernel radius $R = \lceil \text{truncate} \cdot \sigma \rceil$ |
 | `filters.gaussian.implementations` | `["direct", "separable"]` | Gaussian variants to run |
 | `metrics.peak` | `1.0` | Peak value in PSNR |
+| `export_npy` | `{"patterns": ["step_edge", "zone_plate"], "sigmas_n": [0.1]}` | Cases exported as float64 `.npy` (optional) |
 | `output_dir` | `"results/default"` | Output folder, relative to this directory |

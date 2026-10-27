@@ -16,12 +16,17 @@ print(cfg["noise"])
 out_dir = HERE / cfg["output_dir"]
 out_dir.mkdir(parents=True, exist_ok=True)
 
+# copy config to output dir for reproduciblity
+import shutil
+shutil.copy(args.config, out_dir / "config.json")
+
 from fixtures import PATTERNS
 from preview import save_png, save_error_png
 from noise import unit_noise, add_noise
 from filters import filter_variants
 import csv
 from metrics import mse, psnr
+import numpy as np
 
 # main loop
 # generate clean patterns -> apply noise on the pattern -> filter the noised image
@@ -36,18 +41,34 @@ for W, H in cfg["sizes"]:
         img_dir = out_dir / "images" / name
         img_dir.mkdir(parents=True, exist_ok=True)
         save_png(img_dir / f"{W}x{H}.png", x) # save the baseline pattern
+
+        # noise loop
         for s in cfg["noise"]["sigmas"]:
             # 2. apply gaussian noise:
             y = add_noise(x, z, s)
             save_png(img_dir / f"{W}x{H}_n{s}.png", y) # save the noisy image
+
+            # save clean + noised pattern in npy files for other experiements (e.g., cuda)
+            exp = cfg.get("export_npy")
+            export = exp is not None and name in exp["patterns"] and s in exp["sigmas_n"]
+            if export:
+                npy_dir = out_dir / "npy" / name
+                npy_dir.mkdir(parents=True, exist_ok=True)
+                np.save(npy_dir / f"{W}x{H}.npy", x)                      # clean
+                np.save(npy_dir / f"{W}x{H}_n{s}.npy", y)                 # noisy: input for cuda
+
+            # filtering loop
             for f_name, f_fn, f_params in variants:
                 # 3. filter the noisy image
                 x_hat = f_fn(y, **f_params)
                 save_png(img_dir / f"{W}x{H}_n{s}_{f_name}.png", x_hat) # save the filtered result
                 rows.append({"pattern": name, "size": f"{W}x{H}", "sigma_n": s,
-                             "filter": f_name, "mse": mse(x_hat, x),
-                             "psnr": psnr(x_hat, x, cfg["metrics"]["peak"])})
+                            "filter": f_name, "blur_sigma": f_params.get("sigma", 0.0),
+                            "mse": mse(x_hat, x), "psnr": psnr(x_hat, x, cfg["metrics"]["peak"])})
                 save_error_png(img_dir / f"{W}x{H}_n{s}_{f_name}_err.png", x_hat - x, s)
+                # save filtered pattern with exact floats in npy files for other experiements (e.g., cuda)
+                if export:
+                    np.save(npy_dir / f"{W}x{H}_n{s}_{f_name}.npy", x_hat)   # expected cuda
 
 # test 1D gaussian weights
 if False:
@@ -60,3 +81,9 @@ with open(out_dir / "metrics.csv", "w", newline="") as f:
     w = csv.DictWriter(f, fieldnames=rows[0].keys())
     w.writeheader()
     w.writerows(rows)
+
+# plot results
+from plot import plot_sweep
+
+for W, H in cfg["sizes"]:
+    plot_sweep(rows, cfg, f"{W}x{H}", out_dir / f"sweep_{W}x{H}.png")
