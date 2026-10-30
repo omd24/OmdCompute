@@ -10,6 +10,7 @@ results/
 build/
 bin/
 out/
+x64/
 *.obj
 *.pdb
 *.ilk
