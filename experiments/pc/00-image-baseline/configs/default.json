@@ -20,7 +20,8 @@
       "truncate": 3.0,
       "boundary": "clamp",
       "implementations": ["direct", "separable"]
-    }
+    },
+    "nlm": { "S": 10, "P": 3, "h_factor": 1.4 }
   },
 
   "metrics": { "peak": 1.0 },

@@ -44,10 +44,30 @@ def gaussian_separable(y, sigma, truncate):
     w1 = gaussian_kernel_1d(sigma, truncate)
     return blur_v(blur_h(y, w1), w1)
 
+def nlm(y, sigma_n, S, P, h_factor):
+    H, W = y.shape
+    h = h_factor * sigma_n
+    T = 2 * P + 1
+    box = np.full(T, 1.0 / T)                        # patch mean = box blur
+    p = np.pad(y, S + P, mode="edge")                # clamp
+    a = p[S : S + H + 2 * P, S : S + W + 2 * P]      # image with a border of P
+    out = np.zeros_like(y)
+    total = np.zeros_like(y)
+    for dj in range(-S, S + 1):                      # search offset
+        for di in range(-S, S + 1):
+            # same idea as gaussian_direct: shift the image for each offset
+            b = p[S + dj : S + dj + H + 2 * P, S + di : S + di + W + 2 * P]
+            d2 = blur_v(blur_h((a - b) ** 2, box), box)[P : P + H, P : P + W]   # border only feeds the blur
+            w = np.exp(-np.maximum(d2 - 2 * sigma_n**2, 0.0) / h**2)
+            out += w * b[P : P + H, P : P + W]
+            total += w
+    return out / total
+
 FILTERS = {
     "no_filter": no_filter,
     "gaussian_direct": gaussian_direct,
     "gaussian_separable": gaussian_separable,
+    "nlm": nlm,
 }
 
 # Takes a filter config and returns all variants of the filter based on different filter settings
@@ -66,5 +86,9 @@ def filter_variants(fcfg):
             variants.append((f"gaussian_{impl}_s{s}",                       # formatted label for file names and metrics
                              FILTERS[f"gaussian_{impl}"],                   # filter function call
                              {"sigma": s, "truncate": g["truncate"]}))      # filter params
+
+    # 3. non-local means
+    if "nlm" in fcfg:
+        variants.append(("nlm", FILTERS["nlm"], fcfg["nlm"]))
             
     return variants

@@ -60,7 +60,8 @@ for W, H in cfg["sizes"]:
             # filtering loop
             for f_name, f_fn, f_params in variants:
                 # 3. filter the noisy image
-                x_hat = f_fn(y, **f_params)
+                extra = {"sigma_n": s} if f_name == "nlm" else {}
+                x_hat = f_fn(y, **f_params, **extra)
                 save_png(img_dir / f"{W}x{H}_n{s}_{f_name}.png", x_hat) # save the filtered result
                 rows.append({"pattern": name, "size": f"{W}x{H}", "sigma_n": s,
                             "filter": f_name, "blur_sigma": f_params.get("sigma", 0.0),

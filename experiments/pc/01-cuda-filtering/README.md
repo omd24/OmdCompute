@@ -8,6 +8,7 @@ GPU implementation of image filters in CUDA, verified against a CPU float64 refe
 |---|---|---|
 | `HelloCuda` | Toolchain check: upload, kernel, readback | Done |
 | `GaussianFilter` | Direct and separable 2D Gaussian: comparison with the float64 reference, timing, shared memory | Done |
+| `NonLocalMeans` | Direct per-pixel non-local means: comparison with the float64 reference, timing | Base version |
 
 ```bash
 python ../00-image-baseline/run.py               # generates the float64 reference (.npy)
@@ -350,6 +351,34 @@ Counter checks, with $2048^2 / 32 = 131072$ warps: `gaussian_direct` fused FP32 
 | `blur_v` is 17.6% slower than `blur_h` under the profiler, but not in the Timing section | L2 hit rate 27% against 33%, with about one full image read from device memory. In the application the input is probably already in L2; not verified |
 | Half of the `blur_v` loads read weights | The weights contribute to load pressure |
 | Theoretical occupancy is 66.7% (8 of 12 warps) for all three kernels | Limited by registers and warps per block; the 32×32 block occupies 32 warps |
+
+## NonLocalMeans
+
+Definition, parameters and quality comparison: [00 — Non-local means](../00-image-baseline/README.md#non-local-means). Base version: every read goes to device memory, with no shared memory or separable patch distance.
+
+```
+for each offset (dj, di) in [-S, S]²:
+    d2 = mean over patch of (in[p + k] - in[p + (dj, di) + k])²
+    w  = exp(-max(d2 - 2σn², 0) / h²)
+    sum += w * in[p + (dj, di)];  total += w
+out[p] = sum / total
+```
+
+$S = 10$, $P = 3$, $h = 0.14$: 43,659 image reads per pixel. Block 32×32, laptop GPU, Release.
+
+| Check, against float64 reference | Result |
+|---|---|
+| Maximum error, 4 cases (`step_edge`, `zone_plate`; 256×256, 257×129) | 3.55e-6 |
+| `compute-sanitizer`, separate test with the same kernel | 0 errors |
+
+CPU wait in ms, 11 runs after 3 warm-up launches, noisy input (the weights depend on the data).
+
+| Size | Median | Min | Max |
+|---|---|---|---|
+| 256×256 | 1.85 | 1.60 | 2.19 |
+| 2048×2048 | 93.98 | 89.84 | 114.41 |
+
+Block sizes are not compared here: in a separate run, SM clock samples ranged from 1.4 to 2.4 GHz under a software power cap, and the ordering of 32×32 and 32×8 changed between runs.
 
 ## Environment
 

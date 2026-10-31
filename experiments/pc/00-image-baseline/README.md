@@ -2,7 +2,7 @@
 
 **Track:** PC series (M0) · **Status:** Done
 
-Procedural test images with exact ground truth, additive Gaussian noise, classical Gaussian denoising filters and error metrics, as a CPU float64 reference.
+Procedural test images with exact ground truth, additive Gaussian noise, classical denoising filters (Gaussian, non-local means) and error metrics, as a CPU float64 reference.
 
 ```mermaid
 flowchart LR
@@ -58,6 +58,7 @@ $$y = x + \sigma_n z, \qquad z[v,u] \sim \mathcal{N}(0, 1) \ \text{i.i.d.}$$
 | `no_filter` | $\hat{x} = y$ |
 | `gaussian_direct` | $\hat{x}[v,u] = \sum\limits_{j=-R}^{R}\sum\limits_{i=-R}^{R} w_j w_i \cdot y\big[c_v(v+j), c_u(u+i)\big]$ |
 | `gaussian_separable` | $t[v,u] = \sum\limits_{i} w_i \cdot y\big[v, c_u(u+i)\big], \qquad \hat{x}[v,u] = \sum\limits_{j} w_j \cdot t\big[c_v(v+j), u\big]$ |
+| `nlm` | See [Non-local means](#non-local-means) |
 
 Kernel and boundary:
 
@@ -101,6 +102,48 @@ $\sigma_n = 0.1$, 256×256.
 | `step_edge` | <img src="figures/filters/step_edge_n0.1.png" width="96"> | <img src="figures/filters/step_edge_n0.1_s1.0.png" width="96"> | <img src="figures/filters/step_edge_n0.1_s2.0.png" width="96"> | <img src="figures/filters/step_edge_n0.1_s4.0.png" width="96"> |
 | `checkerboard` | <img src="figures/filters/checkerboard_n0.1.png" width="96"> | <img src="figures/filters/checkerboard_n0.1_s1.0.png" width="96"> | <img src="figures/filters/checkerboard_n0.1_s2.0.png" width="96"> | <img src="figures/filters/checkerboard_n0.1_s4.0.png" width="96"> |
 | `zone_plate` | <img src="figures/filters/zone_plate_n0.1.png" width="96"> | <img src="figures/filters/zone_plate_n0.1_s1.0.png" width="96"> | <img src="figures/filters/zone_plate_n0.1_s2.0.png" width="96"> | <img src="figures/filters/zone_plate_n0.1_s4.0.png" width="96"> |
+
+### Non-local means
+
+Weighted average over a search window, with weights set by patch similarity. The weights depend on $y$, so the filter is not a convolution.
+
+$$\hat{x}[p] = \frac{\sum_{q} w(p,q) \cdot y[q]}{\sum_{q} w(p,q)}, \qquad q \in p + [-S, S]^2$$
+
+$$d^2(p,q) = \frac{1}{(2P+1)^2} \sum_{k \in [-P, P]^2} \big(y[p+k] - y[q+k]\big)^2$$
+
+$$w(p,q) = \exp\left(-\frac{\max(d^2(p,q) - 2\sigma_n^2, 0)}{h^2}\right), \qquad h = h_f \cdot \sigma_n$$
+
+$2\sigma_n^2$ is the expected value of $d^2$ for two identical patches under independent noise. Coordinates are clamped after adding the offsets, as for the Gaussian filters.
+
+| Filter | Weight depends on |
+|---|---|
+| Gaussian | Distance from $p$ |
+| Bilateral | Distance from $p$, difference of single values |
+| Non-local means | Difference of patches |
+
+For one offset $q - p$, $d^2$ is a box filter of the squared difference image, which is separable. The weights are not.
+
+```
+for each offset (dj, di) in [-S, S]²:                  # per-tap order, whole images
+    b  = shift(y_padded, dj, di)
+    d2 = box_v(box_h((y_padded - b)²))                 # patch mean
+    w  = exp(-max(d2 - 2σn², 0) / h²)
+    out   += w * b
+    total += w
+x̂ = out / total
+```
+
+| | Patch terms per pixel | $S = 10$, $P = 3$ |
+|---|---|---|
+| Per-pixel definition | $(2S+1)^2 (2P+1)^2$ | 21,609 |
+| Per-offset, separable box | $(2S+1)^2 \cdot 2(2P+1)$ | 6,174 |
+
+Parameters: $S = 10$, $P = 3$, $h_f = 1.4$. Selection of $h_f$, PSNR [dB], 256×256, $\sigma_n = 0.1$:
+
+| Pattern | $h_f = 0.4$ | $0.7$ | $1.0$ | $1.4$ | $2.0$ | $2.8$ |
+|---|---|---|---|---|---|---|
+| `step_edge` | 38.73 | 41.59 | 42.79 | **43.27** | 43.17 | 37.40 |
+| `zone_plate` | 24.31 | 28.52 | 30.77 | **31.19** | 27.80 | 22.18 |
 
 ## Metrics
 
@@ -152,6 +195,38 @@ PSNR [dB] versus blur $\sigma$ ($\sigma = 0$: `no_filter`), one curve per $\sigm
 
 <img src="figures/sweep/sweep_256x256.png" width="720">
 
+### Non-local means against Gaussian
+
+PSNR [dB], 256×256, $\sigma_n = 0.1$. Best Gaussian: highest PSNR over the four $\sigma$, selected per cell with knowledge of $x$. NLM parameters are fixed.
+
+| Pattern | `no_filter` | Best Gaussian | Gaussian $\sigma$ | NLM | Gain |
+|---|---|---|---|---|---|
+| `gradient` | 20.00 | 42.69 | 4 | **44.89** | +2.20 |
+| `diagonal_gradient` | 20.00 | 42.65 | 4 | **44.96** | +2.31 |
+| `flat` | 20.00 | 42.70 | 4 | **45.26** | +2.56 |
+| `step_edge` | 20.00 | 28.12 | 1 | **43.27** | +15.15 |
+| `checkerboard` ($k = 8$) | 20.00 | 19.83 | 0.5 | **27.53** | +7.70 |
+| `zone_plate` | 20.00 | 18.42 | 0.5 | **31.19** | +12.77 |
+
+Gain [dB] against the best Gaussian, 256×256.
+
+| Pattern | $\sigma_n = 0.02$ | $\sigma_n = 0.05$ | $\sigma_n = 0.1$ | $\sigma_n = 0.2$ |
+|---|---|---|---|---|
+| `gradient` | −4.97 | +0.65 | +2.20 | +2.51 |
+| `diagonal_gradient` | −1.98 | +1.59 | +2.31 | +2.49 |
+| `flat` | +2.56 | +2.56 | +2.56 | +2.56 |
+| `step_edge` | +21.27 | +18.99 | +15.15 | +9.15 |
+| `checkerboard` | +19.60 | +12.18 | +7.70 | +0.37 |
+| `zone_plate` | +15.56 | +15.02 | +12.77 | +5.77 |
+
+256×256, $\sigma_n = 0.1$. Error scale as in [Error maps](#error-maps).
+
+| Pattern | Noisy | Best Gaussian | NLM | Gaussian error | NLM error |
+|---|---|---|---|---|---|
+| `step_edge` | <img src="figures/filters/step_edge_n0.1.png" width="96"> | <img src="figures/filters/step_edge_n0.1_s1.0.png" width="96"> | <img src="figures/filters/step_edge_n0.1_nlm.png" width="96"> | <img src="figures/metrics/step_edge_n0.1_s1.0_err.png" width="96"> | <img src="figures/metrics/step_edge_n0.1_nlm_err.png" width="96"> |
+| `checkerboard` | <img src="figures/filters/checkerboard_n0.1.png" width="96"> | <img src="figures/filters/checkerboard_n0.1_s0.5.png" width="96"> | <img src="figures/filters/checkerboard_n0.1_nlm.png" width="96"> | <img src="figures/metrics/checkerboard_n0.1_s0.5_err.png" width="96"> | <img src="figures/metrics/checkerboard_n0.1_nlm_err.png" width="96"> |
+| `zone_plate` | <img src="figures/filters/zone_plate_n0.1.png" width="96"> | <img src="figures/filters/zone_plate_n0.1_s0.5.png" width="96"> | <img src="figures/filters/zone_plate_n0.1_nlm.png" width="96"> | <img src="figures/metrics/zone_plate_n0.1_s0.5_err.png" width="96"> | <img src="figures/metrics/zone_plate_n0.1_nlm_err.png" width="96"> |
+
 ## Tests
 
 | Test | Property | Tolerance |
@@ -163,6 +238,11 @@ PSNR [dB] versus blur $\sigma$ ($\sigma = 0$: `no_filter`), one curve per $\sigm
 | `flat_noise_mse_matches_theory` | interior MSE $= \sigma_n^2 (\sum w_i^2)^2$ | 10 % (finite-sample estimate) |
 | `psnr_values` | $\text{PSNR}(x, x) = \infty$; RMS 0.1 → 20 dB | $10^{-9}$ |
 | `noise_is_reproducible` | same seed → identical $z$; different seed → different $z$ | exact |
+| `nlm_matches_brute_force` | `nlm` = independent per-pixel definition, 17×11 | $10^{-12}$ |
+| `nlm_flat_is_unchanged` | constant input unchanged | $10^{-12}$ |
+| `nlm_large_h_is_a_box_filter` | $h \to \infty$: box filter of radius $S$ | $10^{-9}$ |
+| `nlm_transpose_symmetry` | filtering the transpose = transpose of the result | $10^{-12}$ |
+| `nlm_beats_best_gaussian` | `step_edge`, `zone_plate`, both sizes: PSNR above the best Gaussian | 3 dB margin |
 
 ## Outputs
 
@@ -185,7 +265,11 @@ results/<output_dir>/
 | Error band at the step widens with $\sigma$ | <a href="figures/metrics/step_edge_n0.1_s4.0_err.png"><img src="figures/metrics/step_edge_n0.1_s4.0_err.png" width="96"></a> | The smeared edge is the cost of blurring |
 | Lighter cells along the image border | <a href="figures/metrics/checkerboard_n0.1_s2.0_err.png"><img src="figures/metrics/checkerboard_n0.1_s2.0_err.png" width="96"></a> | Clamping repeats border pixels, so less averaging happens there |
 
-One blur strength cannot suit both flat areas (strong blur preferred) and edges or fine detail (little blur preferred). A filter that reduces blurring near edges, or learns where to blur, addresses this.
+| NLM gains most on `step_edge` and `zone_plate` | <a href="figures/metrics/step_edge_n0.1_nlm_err.png"><img src="figures/metrics/step_edge_n0.1_nlm_err.png" width="96"></a> | Patches across an edge differ, so averaging stops at the edge. These patterns also repeat, which favours a search for similar patches |
+| NLM loses to Gaussian on `gradient` at $\sigma_n = 0.02$ | | Across the search window the ramp changes by more than $h$, which reduces averaging; consistent with the 5 dB loss, not separately tested |
+| `checkerboard` gain falls to +0.37 dB at $\sigma_n = 0.2$ | | Cause not established |
+
+One blur strength cannot suit both flat areas (strong blur preferred) and edges or fine detail (little blur preferred). Non-local means addresses this with weights derived from the image; a learned filter is a further option.
 
 ## Limitations
 
@@ -193,6 +277,7 @@ One blur strength cannot suit both flat areas (strong blur preferred) and edges 
 - I.i.d. additive Gaussian noise; signal-dependent and rendering (Monte Carlo) noise are not modelled.
 - PSNR/MSE only; no perceptual metric.
 - Clamp boundary only.
+- $h_f$ was selected on the same patterns used for evaluation, and $\sigma_n$ is taken as known. The patterns are highly self-similar, so the NLM gains do not transfer directly to natural images.
 
 ## Environment
 
@@ -210,6 +295,7 @@ CPU only: AMD Ryzen 9 9955HX3D, Windows 11, Python 3.13.5, NumPy 2.5.2, Pillow 1
 | `filters.gaussian.sigmas` | `[0.5, 1.0, 2.0, 4.0]` | Blur standard deviations $\sigma$ |
 | `filters.gaussian.truncate` | `3.0` | Kernel radius $R = \lceil \text{truncate} \cdot \sigma \rceil$ |
 | `filters.gaussian.implementations` | `["direct", "separable"]` | Gaussian variants to run |
+| `filters.nlm` | `{"S": 10, "P": 3, "h_factor": 1.4}` | Non-local means: search radius, patch radius, $h_f$ (optional) |
 | `metrics.peak` | `1.0` | Peak value in PSNR |
 | `export_npy` | `{"patterns": ["step_edge", "zone_plate"], "sigmas_n": [0.1]}` | Cases exported as float64 `.npy` (optional) |
 | `output_dir` | `"results/default"` | Output folder, relative to this directory |
