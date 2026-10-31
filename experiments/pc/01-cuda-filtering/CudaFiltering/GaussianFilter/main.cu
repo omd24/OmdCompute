@@ -17,6 +17,7 @@ const int   s_sizes[][2] = { {256, 256}, {257, 129} };
 const float s_sigmas[]   = { 0.5f, 1.0f, 2.0f, 4.0f };
 const float s_truncate   = 3.0f;
 const char* s_sigma_n    = "0.1";
+const int s_blocks[][2] = { {32, 32}, {32, 16}, {16, 16}, {32, 8}, {64, 8}, {128, 4}, {32, 32} };
 
 // cpu-side: compute 1D gaussian weights (2R+1 weights)
 std::vector<float> gaussian_kernel_1d(float sigma, float truncate)
@@ -55,7 +56,7 @@ __global__ void gaussian_direct(const float* in, float* out, const float* w, int
 }
 
 // 
-std::vector<float> filter_direct(const ImageD& y, float sigma, float truncate)
+std::vector<float> filter_direct(const ImageD& y, float sigma, float truncate, dim3 block)
 {
     std::vector<float> in(y.data.size());
     for (size_t i = 0; i < in.size(); ++i) in[i] = float(y.data[i]);  // float64 -> float32
@@ -73,7 +74,6 @@ std::vector<float> filter_direct(const ImageD& y, float sigma, float truncate)
     CUDA_CHECK(cudaMemcpy(d_w, w.data(), w.size() * sizeof(float), cudaMemcpyHostToDevice));
 
     // dispatch gpu work
-    dim3 block(32, 32);                              // [numthreads(32, 32, 1)]
     dim3 grid((y.W + block.x - 1) / block.x, (y.H + block.y - 1) / block.y);
     gaussian_direct<<<grid, block>>>(d_in, d_out, d_w, R, y.W, y.H);
     CUDA_CHECK(cudaGetLastError());
@@ -119,7 +119,7 @@ __global__ void blur_v(const float* in, float* out, const float* w, int R, int W
     out[v * W + u] = sum;
 }
 
-std::vector<float> filter_separable(const ImageD& y, float sigma, float truncate)
+std::vector<float> filter_separable(const ImageD& y, float sigma, float truncate, dim3 block)
 {
     std::vector<float> in(y.data.size());
     for (size_t i = 0; i < in.size(); ++i) in[i] = float(y.data[i]);  // float64 -> float32
@@ -143,7 +143,6 @@ std::vector<float> filter_separable(const ImageD& y, float sigma, float truncate
     // dispatch gpu work
     // NOTE: No barrier is needed between the passes. 
     // Kernels launched on the same stream run in order, and each one sees the previous one's writes
-    dim3 block(32, 32);                              // [numthreads(32, 32, 1)]
     dim3 grid((y.W + block.x - 1) / block.x, (y.H + block.y - 1) / block.y);
 
     // horizontal blur
@@ -207,7 +206,7 @@ void time_launch(const char* name, int W, int H, float sigma, F launch)
         W, H, sigma, name, first, t[runs / 2], t[0]);
 }
 
-void time_filters(int W, int H, float sigma)
+void time_filters(int W, int H, float sigma, dim3 block)
 {
     std::vector<float> h(size_t(W) * H, 0.5f);       // kernels have no data-dependent branches
     std::vector<float> w = gaussian_kernel_1d(sigma, s_truncate);
@@ -227,7 +226,6 @@ void time_filters(int W, int H, float sigma)
     CUDA_CHECK(cudaDeviceSynchronize());
     double upload = ms_since(t0);
 
-    dim3 block(32, 32);
     dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
 
     time_launch("direct", W, H, sigma, [&]() {
@@ -296,10 +294,17 @@ int main()
     printf("timings in ms\n\n");
 
     // using constant 0.5 image. Timings cost only depends only on W, H and R
-    for (float sigma : s_sigmas) time_filters(256, 256, sigma);
-    for (float sigma : s_sigmas) time_filters(2048, 2048, sigma);
+    //for (float sigma : s_sigmas) time_filters(256, 256, sigma);
+
+    // test various block sizes at 2k
+    for (const auto& b : s_blocks)
+    {
+        printf("block %dx%d\n", b[0], b[1]);
+        for (float sigma : s_sigmas) time_filters(2048, 2048, sigma, dim3(b[0], b[1]));
+    }
 
     // error loop
+    for (const auto& b : s_blocks)
     for (const char* p : s_patterns)
     for (const auto& s : s_sizes)
     for (float sigma : s_sigmas)
@@ -310,8 +315,8 @@ int main()
 
         ImageD y   = load_npy(base + ".npy");            // noisy input
         ImageD ref = load_npy(base + suffix);            // expected float64 output
-        std::vector<float> dir_out = filter_direct(y, sigma, s_truncate);
-        std::vector<float> sep_out = filter_separable(y, sigma, s_truncate);
+        std::vector<float> dir_out = filter_direct(y, sigma, s_truncate, dim3(b[0], b[1]));
+        std::vector<float> sep_out = filter_separable(y, sigma, s_truncate, dim3(b[0], b[1]));
         assert(dir_out.size() == sep_out.size());
 
         // compare and output results:

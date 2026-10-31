@@ -1,7 +1,5 @@
 # OmdCompute — Roadmap
 
-**Updated:** 25 October 2026 · **Status:** planning; no implementation, training or benchmarks completed.
-
 ## 1. Purpose
 
 The lab takes real-time rendering as its starting point and extends into adjacent fields: general GPU computing, modern ML engineering, neural graphics and computer vision, on-device inference, and optionally ML compilation.

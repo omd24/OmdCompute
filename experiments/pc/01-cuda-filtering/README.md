@@ -246,6 +246,29 @@ $k$: launches (direct 1, separable 2). $t_0$: fixed cost per launch. $c$: cost p
 | `blur_v` is not slower than `blur_h` | Row-crossing reads carry no visible penalty at these sizes; see [Nsight Compute](#nsight-compute) |
 | Transfers exceed the separable filter time at 2048×2048 | Per-frame readback would dominate this workload |
 
+### Block size
+
+CPU wait, medians in ms, 2048×2048, one run, laptop GPU, Release. The 32×32 block runs first and last as a control against ordering effects.
+
+| Block | Separable $\sigma = 0.5$ | $\sigma = 1$ | $\sigma = 2$ | $\sigma = 4$ | Direct $\sigma = 0.5$ | $\sigma = 1$ | $\sigma = 2$ | $\sigma = 4$ |
+|---|---|---|---|---|---|---|---|---|
+| 32×32, first | 0.084 | 0.102 | 0.148 | 0.227 | 0.117 | 0.203 | 0.554 | 1.943 |
+| 32×16 | 0.076 | 0.094 | 0.131 | 0.185 | 0.118 | 0.216 | 0.693 | 2.011 |
+| 16×16 | 0.066 | 0.076 | 0.111 | 0.201 | 0.108 | 0.182 | 0.543 | 2.099 |
+| 32×8 | 0.064 | 0.073 | 0.108 | 0.185 | 0.107 | 0.178 | 0.533 | 1.931 |
+| 64×8 | 0.071 | 0.075 | 0.113 | 0.181 | 0.111 | 0.184 | 0.546 | 1.929 |
+| 128×4 | 0.068 | 0.082 | 0.120 | 0.185 | 0.111 | 0.179 | 0.545 | 1.984 |
+| 32×32, last | 0.095 | 0.101 | 0.157 | 0.231 | 0.128 | 0.204 | 0.563 | 1.984 |
+
+Filter errors at every block size match the 32×32 results to all printed digits.
+
+| Observation | Interpretation |
+|---|---|
+| The control reproduces its first result or is slower | The gain is not an ordering effect |
+| 32×8 reduces separable time by 19 to 28% | Smaller blocks suit the separable passes; cause not established |
+| Direct gains 9 to 12% at $\sigma \le 1$, and little at $\sigma \ge 2$ | Consistent with load issue rate limiting the direct filter |
+| 32×16 slows direct at $\sigma = 2$ by 14 to 27% | Present in all three runs, with varying size; cause not established |
+
 ## Profiling
 
 Launch settings for Nsight Systems and Nsight Compute, with `<repo>` as the absolute repository path:
@@ -291,7 +314,7 @@ Counter checks, with $2048^2 / 32 = 131072$ warps: `gaussian_direct` fused FP32 
 
 ## Known limitations
 
-These results form the unoptimised baseline. Block size and shared memory variants have not been evaluated.
+Nsight results cover the 32×32 block only. Shared memory variants have not been evaluated.
 
 ## Environment
 
