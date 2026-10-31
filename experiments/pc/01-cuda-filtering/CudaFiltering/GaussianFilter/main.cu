@@ -4,6 +4,7 @@
 #include <numeric>
 #include <cmath>
 #include <cassert>
+#include <chrono>
 
 // every CUDA API call returns an error code; this macro stops with file/line on failure
 #define CUDA_CHECK(x) do { cudaError_t e = (x); if (e != cudaSuccess) {          \
@@ -77,9 +78,14 @@ std::vector<float> filter_direct(const ImageD& y, float sigma, float truncate)
     gaussian_direct<<<grid, block>>>(d_in, d_out, d_w, R, y.W, y.H);
     CUDA_CHECK(cudaGetLastError());
 
-    // readback results (gpu-to-cpu) and return outputs
+    // readback results (gpu-to-cpu)
     CUDA_CHECK(cudaMemcpy(out.data(), d_out, bytes, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_in)); CUDA_CHECK(cudaFree(d_out)); CUDA_CHECK(cudaFree(d_w));
+    
+    // free resources
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_w));
+
     return out;
 }
 
@@ -139,8 +145,13 @@ std::vector<float> filter_separable(const ImageD& y, float sigma, float truncate
     // Kernels launched on the same stream run in order, and each one sees the previous one's writes
     dim3 block(32, 32);                              // [numthreads(32, 32, 1)]
     dim3 grid((y.W + block.x - 1) / block.x, (y.H + block.y - 1) / block.y);
+
+    // horizontal blur
     blur_h<<<grid, block>>>(d_in,  d_tmp, d_w, R, y.W, y.H);
+
+    // vertical blur
     blur_v<<<grid, block>>>(d_tmp, d_out, d_w, R, y.W, y.H);
+
     CUDA_CHECK(cudaGetLastError());
 
     // readback results (gpu-to-cpu)
@@ -155,6 +166,125 @@ std::vector<float> filter_separable(const ImageD& y, float sigma, float truncate
     return out;
 }
 
+//Timing
+using Clock = std::chrono::steady_clock;
+
+double ms_since(Clock::time_point t0)
+{
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+}
+
+
+float median(std::vector<float> t) // by value: sorts a copy
+{
+    std::sort(t.begin(), t.end());
+    return t[t.size() / 2];
+}
+
+// first launch (reported alone), warm-up (discarded), then steady-state runs
+template <typename F>
+void time_launch(const char* name, int W, int H, float sigma, F launch)
+{
+    const int warmup = 10, runs = 100;
+
+    auto t0 = Clock::now();
+    launch();
+    CUDA_CHECK(cudaDeviceSynchronize());     // launches are async: wait, or only the launch call is timed
+    double first = ms_since(t0);
+
+    for (int r = 0; r < warmup; ++r) { launch(); CUDA_CHECK(cudaDeviceSynchronize()); }
+
+    std::vector<double> t(runs);
+    for (int r = 0; r < runs; ++r)
+    {
+        t0 = Clock::now();
+        launch();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        t[r] = ms_since(t0);
+    }
+    std::sort(t.begin(), t.end());
+    printf("%4dx%-4d s=%.1f [cpu wait] %-9s first %7.3f  median %7.3f  min %7.3f\n",
+        W, H, sigma, name, first, t[runs / 2], t[0]);
+}
+
+void time_filters(int W, int H, float sigma)
+{
+    std::vector<float> h(size_t(W) * H, 0.5f);       // kernels have no data-dependent branches
+    std::vector<float> w = gaussian_kernel_1d(sigma, s_truncate);
+    int R = (int(w.size()) - 1) / 2;
+    size_t bytes = h.size() * sizeof(float);
+
+    float* d_in = nullptr; float* d_tmp = nullptr; float* d_out = nullptr; float* d_w = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_in, bytes));
+    CUDA_CHECK(cudaMalloc(&d_tmp, bytes));
+    CUDA_CHECK(cudaMalloc(&d_out, bytes));
+    CUDA_CHECK(cudaMalloc(&d_w, w.size() * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_w, w.data(), w.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    // cpu-timing
+    auto t0 = Clock::now();
+    CUDA_CHECK(cudaMemcpy(d_in, h.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    double upload = ms_since(t0);
+
+    dim3 block(32, 32);
+    dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
+
+    time_launch("direct", W, H, sigma, [&]() {
+        gaussian_direct<<<grid, block>>>(d_in, d_out, d_w, R, W, H);
+    });
+    time_launch("separable", W, H, sigma, [&]() {
+        blur_h<<<grid, block>>>(d_in, d_tmp, d_w, R, W, H);
+        blur_v<<<grid, block>>>(d_tmp, d_out, d_w, R, W, H);
+    });
+    
+#pragma region Gpu timing: events around each pass
+
+    cudaEvent_t e0, e1, e2;
+    CUDA_CHECK(cudaEventCreate(&e0));
+    CUDA_CHECK(cudaEventCreate(&e1));
+    CUDA_CHECK(cudaEventCreate(&e2));
+
+    const int runs = 100;
+    std::vector<float> t_dir(runs), t_sep(runs), t_h(runs), t_v(runs);
+    for (int r = 0; r < runs; ++r)
+    {
+        CUDA_CHECK(cudaEventRecord(e0));
+        gaussian_direct<<<grid, block>>>(d_in, d_out, d_w, R, W, H);
+        CUDA_CHECK(cudaEventRecord(e1));
+        CUDA_CHECK(cudaEventSynchronize(e1));
+        CUDA_CHECK(cudaEventElapsedTime(&t_dir[r], e0, e1));
+
+        CUDA_CHECK(cudaEventRecord(e0));
+        blur_h<<<grid, block>>>(d_in, d_tmp, d_w, R, W, H);
+        CUDA_CHECK(cudaEventRecord(e1));
+        blur_v<<<grid, block>>>(d_tmp, d_out, d_w, R, W, H);
+        CUDA_CHECK(cudaEventRecord(e2));
+        CUDA_CHECK(cudaEventSynchronize(e2));
+        CUDA_CHECK(cudaEventElapsedTime(&t_h[r], e0, e1));
+        CUDA_CHECK(cudaEventElapsedTime(&t_v[r], e1, e2));
+        CUDA_CHECK(cudaEventElapsedTime(&t_sep[r], e0, e2));   // whole separable filter
+    }
+    printf("%4dx%-4d s=%.1f [gpu time] direct %7.3f  separable %7.3f  blur_h %7.3f  blur_v %7.3f\n",
+      W, H, sigma, median(t_dir), median(t_sep), median(t_h), median(t_v));
+
+    CUDA_CHECK(cudaEventDestroy(e0));
+    CUDA_CHECK(cudaEventDestroy(e1));
+    CUDA_CHECK(cudaEventDestroy(e2));
+#pragma endregion
+
+    CUDA_CHECK(cudaGetLastError());
+
+    t0 = Clock::now();
+    CUDA_CHECK(cudaMemcpy(h.data(), d_out, bytes, cudaMemcpyDeviceToHost));
+    double readback = ms_since(t0);
+    printf("%4dx%-4d s=%.1f [transfer] upload %7.3f  readback %7.3f\n\n", W, H, sigma, upload, readback);
+
+    CUDA_CHECK(cudaFree(d_in)); CUDA_CHECK(cudaFree(d_tmp));
+    CUDA_CHECK(cudaFree(d_out)); CUDA_CHECK(cudaFree(d_w));
+}
+
+//
 int main()
 {
 
@@ -162,6 +292,14 @@ int main()
 
     const std::string root = "../../../00-image-baseline/results/default/npy/";
 
+    // timing loop
+    printf("timings in ms\n\n");
+
+    // using constant 0.5 image. Timings cost only depends only on W, H and R
+    for (float sigma : s_sigmas) time_filters(256, 256, sigma);
+    for (float sigma : s_sigmas) time_filters(2048, 2048, sigma);
+
+    // error loop
     for (const char* p : s_patterns)
     for (const auto& s : s_sizes)
     for (float sigma : s_sigmas)
@@ -184,7 +322,7 @@ int main()
             max_err_sep = std::fmax(max_err_sep, std::fabs(double(sep_out[i]) - ref.data[i]));
             diff = std::fmax(diff, std::fabs(double(dir_out[i]) - double(sep_out[i])));
         }
-        printf("%-10s %dx%d s=%.1f  direct %.2e  separable %.2e  diff %.2e\n",
+        printf("%-10s %4dx%-4d s=%.1f  direct %.2e  separable %.2e  diff %.2e\n",
             p, s[0], s[1], sigma, max_err_dir, max_err_sep, diff);
     }
     

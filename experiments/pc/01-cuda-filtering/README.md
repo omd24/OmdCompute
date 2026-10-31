@@ -7,7 +7,7 @@ GPU implementation of image filters in CUDA, verified against a CPU float64 refe
 | Part | Content | Status |
 |---|---|---|
 | `HelloCuda` | Toolchain check: upload, kernel, readback | Done |
-| `GaussianFilter` | Direct and separable 2D Gaussian, compared with the float64 reference | Done |
+| `GaussianFilter` | Direct and separable 2D Gaussian: comparison with the float64 reference, timing | Done |
 
 ```bash
 python ../00-image-baseline/run.py               # generates the float64 reference (.npy)
@@ -169,6 +169,82 @@ Largest error of each column:
 | Debug and Release differ in the last digits (e.g. 5.38e-7 and 4.80e-7) | Compiled floating-point operations differ; the error magnitude does not |
 
 The separable form requires fewer taps and, in float32, is the more precise evaluation.
+
+### Timing
+
+Input: constant 0.5 image, 256×256 and 2048×2048. Kernel cost depends on $W$, $H$ and $R$ only, since the kernels contain no data-dependent branches.
+
+| Measure | Clock | Interval |
+|---|---|---|
+| CPU wait | `std::chrono::steady_clock` | Launch until `cudaDeviceSynchronize` returns |
+| GPU time | CUDA events | Between events recorded before and after the kernel |
+| Transfer | `std::chrono::steady_clock` | `cudaMemcpy`, one measurement per image size and $\sigma$ |
+
+```
+first = time(launch, sync)                     # reported alone
+repeat 10:  launch, sync                       # warm-up, discarded
+repeat 100: time(launch, sync)                 # CPU wait
+repeat 100: event, launch, event, sync         # GPU time
+report the median of each series
+```
+
+Steady-state medians in ms, one run, laptop GPU, Release.
+
+CPU wait. Speed-up is direct / separable.
+
+| Size | $\sigma$ | Direct | Separable | Speed-up | Tap ratio |
+|---|---|---|---|---|---|
+| 256×256 | 0.5 | 0.009 | 0.013 | 0.7 | 2.5 |
+| 256×256 | 1 | 0.011 | 0.013 | 0.8 | 3.5 |
+| 256×256 | 2 | 0.017 | 0.013 | 1.3 | 6.5 |
+| 256×256 | 4 | 0.041 | 0.015 | 2.7 | 12.5 |
+| 2048×2048 | 0.5 | 0.116 | 0.084 | 1.4 | 2.5 |
+| 2048×2048 | 1 | 0.200 | 0.100 | 2.0 | 3.5 |
+| 2048×2048 | 2 | 0.544 | 0.140 | 3.9 | 6.5 |
+| 2048×2048 | 4 | 1.875 | 0.220 | 8.5 | 12.5 |
+
+GPU time.
+
+| Size | $\sigma$ | Direct | Separable | `blur_h` | `blur_v` |
+|---|---|---|---|---|---|
+| 256×256 | 0.5 | 0.010 | 0.017 | 0.009 | 0.008 |
+| 256×256 | 1 | 0.012 | 0.020 | 0.009 | 0.008 |
+| 256×256 | 2 | 0.018 | 0.018 | 0.010 | 0.007 |
+| 256×256 | 4 | 0.040 | 0.017 | 0.010 | 0.007 |
+| 2048×2048 | 0.5 | 0.118 | 0.086 | 0.046 | 0.040 |
+| 2048×2048 | 1 | 0.206 | 0.101 | 0.051 | 0.050 |
+| 2048×2048 | 2 | 0.542 | 0.140 | 0.072 | 0.069 |
+| 2048×2048 | 4 | 1.872 | 0.224 | 0.115 | 0.108 |
+
+Startup and transfers, in ms.
+
+| Quantity | 256×256 | 2048×2048 |
+|---|---|---|
+| First launch, direct | 0.174 | not isolated |
+| First launch, separable | 0.092 | not isolated |
+| Upload | 0.26 to 0.38 | 1.8 to 2.4 |
+| Readback | 0.07 to 0.10 | 1.3 to 1.7 |
+
+Fixed cost per launch, GPU time. Separate test, not part of the solution: median of 200 runs, same grid and block size.
+
+| Kernel | 256×256 | 2048×2048 |
+|---|---|---|
+| Empty | 0.008 | 0.015 |
+| Per-pixel copy, no filtering | 0.008 | 0.028 |
+
+$$t \approx k \cdot t_0 + c \cdot n$$
+
+$k$: launches (direct 1, separable 2). $t_0$: fixed cost per launch. $c$: cost per tap. $n$: taps per pixel.
+
+| Observation | Interpretation |
+|---|---|
+| At 256×256, separable is slower up to $\sigma = 1$ and faster from $\sigma = 2$ | $k \cdot t_0$ dominates small workloads, and separable pays it twice |
+| At 2048×2048, separable is faster at every $\sigma$ | $c \cdot n$ dominates |
+| Speed-up stays below the tap ratio (8.5 against 12.5) | Same fixed cost; separable also performs one additional image write |
+| CPU wait and GPU time agree to 0.006 ms at 2048×2048 | CPU-side launch and synchronisation overhead is small at this size |
+| At 256×256, separable GPU time exceeds CPU wait | Probably the cost of the additional event between passes; not verified |
+| `blur_v` is not slower than `blur_h` | Row-crossing reads carry no visible penalty at these sizes; cause not established |
+| Transfers exceed the separable filter time at 2048×2048 | Per-frame readback would dominate this workload |
 
 ## Environment
 
