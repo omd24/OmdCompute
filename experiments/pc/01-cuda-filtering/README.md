@@ -7,7 +7,7 @@ GPU implementation of image filters in CUDA, verified against a CPU float64 refe
 | Part | Content | Status |
 |---|---|---|
 | `HelloCuda` | Toolchain check: upload, kernel, readback | Done |
-| `GaussianFilter` | Direct 2D Gaussian, compared with the float64 reference | Done |
+| `GaussianFilter` | Direct and separable 2D Gaussian, compared with the float64 reference | Done |
 
 ```bash
 python ../00-image-baseline/run.py               # generates the float64 reference (.npy)
@@ -78,7 +78,7 @@ Inputs: noisy images ($\sigma_n = 0.1$), 256×256 and 257×129. Non-square size 
 | `step_edge` | <img src="../00-image-baseline/figures/noise/step_edge.png" width="96"> | <img src="../00-image-baseline/figures/filters/step_edge_n0.1.png" width="96"> | Kernel shift or asymmetry, border handling |
 | `zone_plate` | <img src="../00-image-baseline/figures/noise/zone_plate.png" width="96"> | <img src="../00-image-baseline/figures/filters/zone_plate_n0.1.png" width="96"> | Wrong weights, swapped axes (all frequencies, both axes) |
 
-### Pipeline
+### Direct
 
 ```mermaid
 flowchart TD
@@ -109,27 +109,66 @@ for j in [-R, R]:
 out[v * W + u] = sum
 ```
 
+### Separable
+
+Definition and cost: [00 — Filters](../00-image-baseline/README.md#filters). Inputs, upload and readback as for the direct filter, with one additional buffer `d_tmp`.
+
+```mermaid
+flowchart LR
+    I["d_in"] --> H["blur_h"] --> T["d_tmp"] --> V["blur_v"] --> O["d_out"]
+    W["d_w"] --> H
+    W --> V
+```
+
+Kernels, per thread:
+
+```
+blur_h: out[v * W + u] = sum over i in [-R, R] of w[i+R] * in[v * W + clamp(u+i, 0, W-1)]
+blur_v: out[v * W + u] = sum over j in [-R, R] of w[j+R] * in[clamp(v+j, 0, H-1) * W + u]
+```
+
+Both launches use the default stream, which executes in order: `blur_v` observes the writes of `blur_h` without an explicit barrier.
+
 ### Results
 
-`max |CUDA (float32) − reference (float64)|`, laptop GPU, Release, 16 cases.
+`max |CUDA (float32) − reference (float64)|`, laptop GPU, Release, 16 cases per filter.
 
-| Pattern, size | $\sigma = 0.5$ | $\sigma = 1$ | $\sigma = 2$ | $\sigma = 4$ |
+| Filter | Pattern, size | $\sigma = 0.5$ | $\sigma = 1$ | $\sigma = 2$ | $\sigma = 4$ |
+|---|---|---|---|---|---|
+| Direct | Taps per pixel | 25 | 49 | 169 | 625 |
+| | `step_edge`, 256×256 | 4.80e-7 | 5.67e-7 | 1.03e-6 | 1.52e-6 |
+| | `step_edge`, 257×129 | 4.67e-7 | 5.04e-7 | 8.50e-7 | 1.50e-6 |
+| | `zone_plate`, 256×256 | 3.46e-7 | 4.33e-7 | 6.36e-7 | 1.19e-6 |
+| | `zone_plate`, 257×129 | 3.05e-7 | 4.63e-7 | 6.21e-7 | 7.99e-7 |
+| Separable | Taps per pixel | 10 | 14 | 26 | 50 |
+| | `step_edge`, 256×256 | 2.77e-7 | 2.76e-7 | 2.91e-7 | 3.35e-7 |
+| | `step_edge`, 257×129 | 2.91e-7 | 3.05e-7 | 2.66e-7 | 4.47e-7 |
+| | `zone_plate`, 256×256 | 2.37e-7 | 2.11e-7 | 1.79e-7 | 2.39e-7 |
+| | `zone_plate`, 257×129 | 2.11e-7 | 1.80e-7 | 1.68e-7 | 2.18e-7 |
+
+Largest error of each column:
+
+| Quantity | $\sigma = 0.5$ | $\sigma = 1$ | $\sigma = 2$ | $\sigma = 4$ |
 |---|---|---|---|---|
-| Taps per pixel | 25 | 49 | 169 | 625 |
-| `step_edge`, 256×256 | 4.80e-7 | 5.67e-7 | 1.03e-6 | 1.52e-6 |
-| `step_edge`, 257×129 | 4.67e-7 | 5.04e-7 | 8.50e-7 | 1.50e-6 |
-| `zone_plate`, 256×256 | 3.46e-7 | 4.33e-7 | 6.36e-7 | 1.19e-6 |
-| `zone_plate`, 257×129 | 3.05e-7 | 4.64e-7 | 6.21e-7 | 7.99e-7 |
+| Direct | 4.80e-7 | 5.67e-7 | 1.03e-6 | 1.52e-6 |
+| Separable | 2.91e-7 | 3.05e-7 | 2.91e-7 | 4.47e-7 |
+| Error ratio, direct / separable | 1.6 | 1.9 | 3.5 | 3.4 |
+| √(direct taps / separable taps) | 1.6 | 1.9 | 2.5 | 3.5 |
+| `max \|direct − separable\|` | 5.96e-7 | 5.96e-7 | 1.07e-6 | 1.55e-6 |
 
 ### Discussion
 
 | Observation | Interpretation |
 |---|---|
-| Maximum error $1.5 \times 10^{-6}$ | float32 rounding ($\varepsilon = 1.2 \times 10^{-7}$ at 1.0): the kernel matches the reference, including borders and the non-square size |
-| Error grows with $\sigma$ | More taps accumulate more rounding error |
+| Maximum error 1.5e-6 (direct), 4.5e-7 (separable) | float32 rounding ($\varepsilon = 1.2 \times 10^{-7}$ at 1.0): both filters match the reference, including borders and the non-square size |
+| Separable error is lower in all 16 cases | Each float32 operation rounds; separable performs fewer operations per pixel (50 terms with one multiplication each, against 625 with two, at $\sigma = 4$) |
+| Direct error grows with $\sigma$ | More taps accumulate more rounding error |
+| Error ratio follows √(tap ratio), except at $\sigma = 2$ | Consistent with rounding errors of random sign accumulating as a random walk |
+| Separable error remains nearly constant with $\sigma$ | Not explained by the tap count. Attenuation of first-pass rounding by the second pass is a candidate; not verified |
+| Direct and separable differ by up to 1.55e-6, against 3.1e-15 in float64 | Identical in exact arithmetic; the difference is float32 rounding, dominated by the direct filter |
 | Debug and Release differ in the last digits (e.g. 5.38e-7 and 4.80e-7) | Compiled floating-point operations differ; the error magnitude does not |
 
-Cost grows with $(2R+1)^2$ taps per pixel. Timing is not yet measured.
+The separable form requires fewer taps and, in float32, is the more precise evaluation.
 
 ## Environment
 
