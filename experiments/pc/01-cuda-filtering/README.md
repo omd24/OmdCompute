@@ -7,7 +7,7 @@ GPU implementation of image filters in CUDA, verified against a CPU float64 refe
 | Part | Content | Status |
 |---|---|---|
 | `HelloCuda` | Toolchain check: upload, kernel, readback | Done |
-| `GaussianFilter` | Direct and separable 2D Gaussian: comparison with the float64 reference, timing | Done |
+| `GaussianFilter` | Direct and separable 2D Gaussian: comparison with the float64 reference, timing, shared memory | Done |
 
 ```bash
 python ../00-image-baseline/run.py               # generates the float64 reference (.npy)
@@ -37,6 +37,7 @@ Same model in HLSL:
 | Descriptor, root signature, PSO | Raw pointer as kernel argument |
 | Upload / readback heap + `CopyBufferRegion` | `cudaMemcpy` |
 | `groupshared` | `__shared__` |
+| `GroupMemoryBarrierWithGroupSync` | `__syncthreads()` |
 | Fence wait | `cudaDeviceSynchronize`, blocking `cudaMemcpy` |
 | `ExecuteCommandLists` (asynchronous) | Kernel launch (asynchronous) |
 | D3D12 debug layer | `compute-sanitizer` (wraps the executable) |
@@ -154,7 +155,7 @@ Largest error of each column:
 | Separable | 2.91e-7 | 3.05e-7 | 2.91e-7 | 4.47e-7 |
 | Error ratio, direct / separable | 1.6 | 1.9 | 3.5 | 3.4 |
 | √(direct taps / separable taps) | 1.6 | 1.9 | 2.5 | 3.5 |
-| `max \|direct − separable\|` | 5.96e-7 | 5.96e-7 | 1.07e-6 | 1.55e-6 |
+| `max abs(direct − separable)` | 5.96e-7 | 5.96e-7 | 1.07e-6 | 1.55e-6 |
 
 ### Discussion
 
@@ -269,6 +270,44 @@ Filter errors at every block size match the 32×32 results to all printed digits
 | Direct gains 9 to 12% at $\sigma \le 1$, and little at $\sigma \ge 2$ | Consistent with load issue rate limiting the direct filter |
 | 32×16 slows direct at $\sigma = 2$ by 14 to 27% | Present in all three runs, with varying size; cause not established |
 
+### Shared memory
+
+`blur_h_shared` and `blur_v_shared` read the weights from block-local storage. The image is still read from device memory.
+
+```
+shared sw[2R+1]                                # one copy per block, undefined at block start
+t = threadIdx.y * blockDim.x + threadIdx.x
+if t < 2R+1: sw[t] = w[t]                      # one thread per weight
+barrier                                        # all threads of the block, including those outside the image
+if u >= W or v >= H: return
+sum over taps, with sw[...] in place of w[...]
+```
+
+Requirement: block size $\ge 2R + 1$ threads. All tested blocks satisfy it, with $2R + 1 \le 25$.
+
+Change in CPU wait, shared against plain separable within the same block and $\sigma$. 2048×2048, medians, one run, laptop GPU, Release.
+
+| Block | $\sigma = 0.5$ | $\sigma = 1$ | $\sigma = 2$ | $\sigma = 4$ |
+|---|---|---|---|---|
+| Weight reads per pixel, per pass | 5 | 7 | 13 | 25 |
+| 32×32, first | +1% | +8% | −13% | −17% |
+| 32×16 | +20% | +13% | +3% | −16% |
+| 16×16 | +11% | +11% | −1% | −18% |
+| 32×8 | +10% | +11% | −2% | −18% |
+| 64×8 | +11% | +7% | +1% | −14% |
+| 128×4 | +11% | +8% | +1% | −15% |
+| 32×32, last | +1% | +3% | −9% | −16% |
+
+| Check | Result |
+|---|---|
+| `max abs(shared − separable)`, 16 cases at each of 7 blocks | 0 |
+| `compute-sanitizer`, separate test: 257×129 and 2048², 3 blocks, 3 values of $\sigma$ | 0 errors |
+
+| Observation | Interpretation |
+|---|---|
+| Shared is 14 to 18% faster at $\sigma = 4$ and up to 20% slower at $\sigma \le 1$ | Weight load and barrier are a cost per block; the saving scales with weight reads per pixel. Not profiled |
+| The 32×32 control is slower at the end of the run (separable +61%, direct +66% at $\sigma = 4$) | GPU clock change is a candidate; clocks were not logged. Times in this run are compared only within one block and $\sigma$ |
+
 ## Profiling
 
 Launch settings for Nsight Systems and Nsight Compute, with `<repo>` as the absolute repository path:
@@ -311,10 +350,6 @@ Counter checks, with $2048^2 / 32 = 131072$ warps: `gaussian_direct` fused FP32 
 | `blur_v` is 17.6% slower than `blur_h` under the profiler, but not in the Timing section | L2 hit rate 27% against 33%, with about one full image read from device memory. In the application the input is probably already in L2; not verified |
 | Half of the `blur_v` loads read weights | The weights contribute to load pressure |
 | Theoretical occupancy is 66.7% (8 of 12 warps) for all three kernels | Limited by registers and warps per block; the 32×32 block occupies 32 warps |
-
-## Known limitations
-
-Nsight results cover the 32×32 block only. Shared memory variants have not been evaluated.
 
 ## Environment
 

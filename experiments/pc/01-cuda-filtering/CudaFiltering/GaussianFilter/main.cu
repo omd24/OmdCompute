@@ -18,6 +18,7 @@ const float s_sigmas[]   = { 0.5f, 1.0f, 2.0f, 4.0f };
 const float s_truncate   = 3.0f;
 const char* s_sigma_n    = "0.1";
 const int s_blocks[][2] = { {32, 32}, {32, 16}, {16, 16}, {32, 8}, {64, 8}, {128, 4}, {32, 32} };
+const int s_max_taps = 25;                           // sigma 4: R = 12, 2R + 1 taps
 
 // cpu-side: compute 1D gaussian weights (2R+1 weights)
 std::vector<float> gaussian_kernel_1d(float sigma, float truncate)
@@ -104,6 +105,28 @@ __global__ void blur_h(const float* in, float* out, const float* w, int R, int W
     out[v * W + u] = sum;
 }
 
+__global__ void blur_h_shared(const float* in, float* out, const float* w, int R, int W, int H)
+{
+    __shared__ float sw[s_max_taps];                 // groupshared: one copy per block
+
+    // each thread loads one weight; t = thread's index inside the block
+    int t = threadIdx.y * blockDim.x + threadIdx.x;
+    if (t < 2 * R + 1) sw[t] = w[t];
+    __syncthreads();                                 // GroupMemoryBarrierWithGroupSync
+
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= W || v >= H) return;                    // must stay after the barrier
+
+    float sum = 0.0f;
+    for (int i = -R; i <= R; ++i)
+    {
+        int ui = min(max(u + i, 0), W - 1);
+        sum += sw[i + R] * in[v * W + ui];
+    }
+    out[v * W + u] = sum;
+}
+
 __global__ void blur_v(const float* in, float* out, const float* w, int R, int W, int H)
 {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
@@ -119,7 +142,29 @@ __global__ void blur_v(const float* in, float* out, const float* w, int R, int W
     out[v * W + u] = sum;
 }
 
-std::vector<float> filter_separable(const ImageD& y, float sigma, float truncate, dim3 block)
+__global__ void blur_v_shared(const float* in, float* out, const float* w, int R, int W, int H)
+{
+    __shared__ float sw[s_max_taps];                 // groupshared: one copy per block
+
+    // each thread loads one weight; t = thread's index inside the block
+    int t = threadIdx.y * blockDim.x + threadIdx.x;
+    if (t < 2 * R + 1) sw[t] = w[t];
+    __syncthreads();                                 // GroupMemoryBarrierWithGroupSync
+
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= W || v >= H) return;   // must stay after the barrier
+
+    float sum = 0.0f;
+    for (int j = -R; j <= R; ++j)
+    {
+        int vj = min(max(v + j, 0), H - 1);
+        sum += sw[j + R] * in[vj * W + u];
+    }
+    out[v * W + u] = sum;
+}
+
+std::vector<float> filter_separable(const ImageD& y, float sigma, float truncate, dim3 block, bool shared = false)
 {
     std::vector<float> in(y.data.size());
     for (size_t i = 0; i < in.size(); ++i) in[i] = float(y.data[i]);  // float64 -> float32
@@ -145,11 +190,16 @@ std::vector<float> filter_separable(const ImageD& y, float sigma, float truncate
     // Kernels launched on the same stream run in order, and each one sees the previous one's writes
     dim3 grid((y.W + block.x - 1) / block.x, (y.H + block.y - 1) / block.y);
 
-    // horizontal blur
-    blur_h<<<grid, block>>>(d_in,  d_tmp, d_w, R, y.W, y.H);
-
-    // vertical blur
-    blur_v<<<grid, block>>>(d_tmp, d_out, d_w, R, y.W, y.H);
+    if (shared)
+    {
+        blur_h_shared<<<grid, block>>>(d_in,  d_tmp, d_w, R, y.W, y.H);
+        blur_v_shared<<<grid, block>>>(d_tmp, d_out, d_w, R, y.W, y.H);
+    }
+    else
+    {
+        blur_h<<<grid, block>>>(d_in,  d_tmp, d_w, R, y.W, y.H);
+        blur_v<<<grid, block>>>(d_tmp, d_out, d_w, R, y.W, y.H);
+    }
 
     CUDA_CHECK(cudaGetLastError());
 
@@ -235,6 +285,11 @@ void time_filters(int W, int H, float sigma, dim3 block)
         blur_h<<<grid, block>>>(d_in, d_tmp, d_w, R, W, H);
         blur_v<<<grid, block>>>(d_tmp, d_out, d_w, R, W, H);
     });
+
+    time_launch("shared", W, H, sigma, [&]() {
+        blur_h_shared<<<grid, block>>>(d_in, d_tmp, d_w, R, W, H);
+        blur_v_shared<<<grid, block>>>(d_tmp, d_out, d_w, R, W, H);
+    });
     
 #pragma region Gpu timing: events around each pass
 
@@ -317,18 +372,21 @@ int main()
         ImageD ref = load_npy(base + suffix);            // expected float64 output
         std::vector<float> dir_out = filter_direct(y, sigma, s_truncate, dim3(b[0], b[1]));
         std::vector<float> sep_out = filter_separable(y, sigma, s_truncate, dim3(b[0], b[1]));
-        assert(dir_out.size() == sep_out.size());
+        std::vector<float> shr_out = filter_separable(y, sigma, s_truncate, dim3(b[0], b[1]), true);
+        assert(dir_out.size() == sep_out.size() && shr_out.size() == sep_out.size());
 
         // compare and output results:
-        double max_err_dir = 0.0, max_err_sep = 0.0, diff = 0.0;
+        double max_err_dir = 0.0, max_err_sep = 0.0, diff_sep = 0.0;
+        double diff_shr = 0.0;
         for (size_t i = 0; i < dir_out.size(); ++i)
         {
             max_err_dir = std::fmax(max_err_dir, std::fabs(double(dir_out[i]) - ref.data[i]));
             max_err_sep = std::fmax(max_err_sep, std::fabs(double(sep_out[i]) - ref.data[i]));
-            diff = std::fmax(diff, std::fabs(double(dir_out[i]) - double(sep_out[i])));
+            diff_sep = std::fmax(diff_sep, std::fabs(double(dir_out[i]) - double(sep_out[i])));
+            diff_shr = std::fmax(diff_shr, std::fabs(double(sep_out[i]) - double(shr_out[i])));
         }
-        printf("%-10s %4dx%-4d s=%.1f  direct %.2e  separable %.2e  diff %.2e\n",
-            p, s[0], s[1], sigma, max_err_dir, max_err_sep, diff);
+        printf("%-10s %4dx%-4d s=%.1f  direct %.2e  separable %.2e  diff %.2e  shared diff %.2e\n",
+            p, s[0], s[1], sigma, max_err_dir, max_err_sep, diff_sep, diff_shr);
     }
     
 #pragma endregion
