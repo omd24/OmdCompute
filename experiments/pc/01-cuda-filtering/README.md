@@ -1,6 +1,6 @@
 # 01 — CUDA filtering
 
-**Track:** PC series (M1) · **Status:** In progress
+**Track:** PC series (M1) · **Status:** Done
 
 GPU implementation of image filters in CUDA, verified against a CPU float64 reference.
 
