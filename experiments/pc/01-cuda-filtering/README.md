@@ -8,7 +8,7 @@ GPU implementation of image filters in CUDA, verified against a CPU float64 refe
 |---|---|---|
 | `HelloCuda` | Toolchain check: upload, kernel, readback | Done |
 | `GaussianFilter` | Direct and separable 2D Gaussian: comparison with the float64 reference, timing, shared memory | Done |
-| `NonLocalMeans` | Direct per-pixel non-local means: comparison with the float64 reference, timing | Base version |
+| `NonLocalMeans` | Direct per-pixel non-local means: comparison with the float64 reference, timing; padded input and separable shared-memory versions | Done |
 
 ```bash
 python ../00-image-baseline/run.py               # generates the float64 reference (.npy)
@@ -354,7 +354,7 @@ Counter checks, with $2048^2 / 32 = 131072$ warps: `gaussian_direct` fused FP32 
 
 ## NonLocalMeans
 
-Definition, parameters and quality comparison: [00 — Non-local means](../00-image-baseline/README.md#non-local-means). Base version: every read goes to device memory, with no shared memory or separable patch distance.
+Definition, parameters and quality comparison: [00 — Non-local means](../00-image-baseline/README.md#non-local-means). `nlm` is the base version: every read goes to device memory, with no shared memory or separable patch distance. Faster versions: [NLM optimizations](#nlm-optimizations).
 
 ```
 for each offset (dj, di) in [-S, S]²:
@@ -380,6 +380,95 @@ CPU wait in ms, 11 runs after 3 warm-up launches, noisy input (the weights depen
 
 Block sizes are not compared here: in a separate run, SM clock samples ranged from 1.4 to 2.4 GHz under a software power cap, and the ordering of 32×32 and 32×8 changed between runs.
 
+## NLM optimizations
+
+Two changes to the base kernel, with the same definition and parameters. Cycles at 2048×2048, in millions, and instructions, in billions:
+
+<img src="figures/nlm_optimization.png" width="560">
+
+### Padded input
+
+`nlm_pad` reads a copy of the image with a clamped border, so no read requires a clamp.
+
+```
+R   = S + P
+pad = image + border of width R, filled by clamping (host, once)
+p   = pad + (v + R) * stride + (u + R)
+q   = p + dj * stride + di
+e   = p[k] - q[k]
+```
+
+### Separable patch distance in shared memory
+
+`nlm_box` applies the patch distance as a box filter per offset $d$, with $T = 2P + 1$:
+
+$$d_d^2[p] = \frac{1}{T^2} \sum_{k_y} \sum_{k_x} \big(y[p + k] - y[p + k + d]\big)^2$$
+
+Each thread holds `sum` and `total` in registers. Row sums stay in `__shared__`: $B (B + 2P)$ floats for block size $B$, 1.5 KB at $B = 32$.
+
+```
+for each offset d:
+    tmp[row] = sum over kx of (pad[row + kx] - pad[row + kx + d])²
+    __syncthreads()
+    d2   = sum over ky of tmp[row + ky] / T²
+    w    = exp(-max(d2 - 2σn², 0) / h²)
+    sum += w * pad[p + d];  total += w
+    __syncthreads()
+out[p] = sum / total
+```
+
+| `__shared__` row | Written by |
+|---|---|
+| Rows of the block | The thread of that row |
+| $P$ rows above | Threads of the first $P$ rows |
+| $P$ rows below | Threads of the last $P$ rows |
+
+All threads run every barrier, including threads outside the image; those threads skip the reads and the output. Each offset requires two barriers: readers must see all rows, and the next offset must not overwrite rows in use.
+
+### Results
+
+| Check | Result |
+|---|---|
+| `nlm_pad`, maximum absolute difference from `nlm`, 2048×2048 | 0 |
+| `nlm_box`, maximum absolute difference from `nlm_pad`, 2048×2048 | 8.34e-7 |
+| `nlm_box`, maximum error against the float64 reference, 4 cases, separate test | 3.55e-6 |
+| `compute-sanitizer`, memory check, separate test, both kernels | 0 errors |
+| `compute-sanitizer --tool racecheck`, `nlm_box`, separate test | 0 hazards |
+
+Paired launches at 2048×2048, 11 pairs after 3 warm-up pairs, CPU wait. Each pair runs back to back, so clock drift affects both kernels nearly equally.
+
+| Ratio | Median | Min | Max |
+|---|---|---|---|
+| `nlm_pad` / `nlm` | 0.714 | 0.681 | 0.744 |
+| `nlm_box` / `nlm_pad` | 0.397 | 0.230 | 0.414 |
+
+Nsight Compute, metric set `full`, `NonLocalMeans.exe`, `NonLocalMeans` working directory, one warmed launch per kernel. Launch skip 46 and count 2 select `nlm` and `nlm_pad`; skip 72 and count 2 select `nlm_pad` and `nlm_box`. `nlm_pad` values are from the second capture; the first gave 156.3M cycles and the same instruction count. Values marked ≈ are read from the report chart.
+
+| 2048×2048 | `nlm` | `nlm_pad` | `nlm_box` |
+|---|---|---|---|
+| Image reads per pixel | 43,659 | 43,659 | 7,773 |
+| Elapsed cycles | 214.8M | 154.0M | 63.6M |
+| Executed instructions | 51.4G | 39.3G | 10.2G |
+| Integer | ≈31G | ≈5.9G | ≈1.5G |
+| Uniform datapath | ≈5.2G | ≈17.3G | ≈2.3G |
+| Load/store | ≈6.9G | ≈5.8G | ≈1.5G |
+| Fused + non-fused FP32 | 6.24G | 6.24G | 1.95G |
+| Compute throughput | 80.5% | 90.8% | 57.3% |
+| Memory throughput | 65.1% | 90.8% | 57.3% |
+| L1/TEX hit rate | 99.99% | 99.99% | 99.95% |
+| SM frequency | 1.42 GHz | 1.30 GHz | 1.18 GHz |
+
+| Observation | Interpretation |
+|---|---|
+| Cycle ratios of 0.72 and 0.41 agree with the paired ratios | Durations are not compared, as the SM frequency differs between launches |
+| `nlm_pad`: integer falls, uniform datapath rises | Per-tap clamps are removed, and loop counters and offsets no longer depend on the thread, so they can be computed once per warp. Not confirmed at source level |
+| `nlm` and `nlm_pad`: 2.83G FMA, 2.83G subtractions, LSU ≈5.7G | One FMA and one subtraction per tap and 43,659 reads per pixel, over 131,072 warps |
+| L1/TEX reports 26.3 of 32 bytes used per sector | A warp reads 32 floats at an unaligned offset, about 4.9 sectors on average; determined by the search offsets |
+| `nlm_pad`: compute and memory both at 90.8% | Load issue limits the kernel together with compute |
+| `nlm_box`: L1/TEX hit rate stays at 99.95% | Row sums and accumulators no longer reach global memory |
+| `nlm_box`: throughput 57.3%, warp cycles per instruction 15.75 against 9.85 | Latency now dominates. Waiting at 882 barriers per block is a candidate cause; not separated |
+| `nlm_box` / `nlm_pad` at 256×256: 0.334, separate test | No launch per offset, so the gain holds at small sizes |
+
 ## Environment
 
-NVIDIA GeForce RTX 5090 Laptop GPU (compute capability 12.0, `sm_120`), driver 617.14, CUDA 13.4, Visual Studio 2022, Windows 11.
+NVIDIA GeForce RTX 5090 Laptop GPU (compute capability 12.0, `sm_120`), driver 617.14 (621.01 for [NLM optimizations](#nlm-optimizations)), CUDA 13.4, Visual Studio 2022, Windows 11.

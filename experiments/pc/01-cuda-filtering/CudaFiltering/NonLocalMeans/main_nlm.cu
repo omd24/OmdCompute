@@ -16,6 +16,7 @@ const int   s_sizes[][2] = { {256, 256}, {257, 129} };
 const float s_sigma_n    = 0.1f;
 const int   s_S = 10, s_P = 3;                       // search and patch radius
 const float s_h = 1.4f * s_sigma_n;
+const int   s_box_block = 32;                        // sizes the shared array, so it is fixed at compile time
 
 __global__ void nlm(const float* in, float* out, int S, int P, float h, float sigma_n, int W, int H)
 {
@@ -54,6 +55,222 @@ __global__ void nlm(const float* in, float* out, int S, int P, float h, float si
     out[v * W + u] = sum / total;                    // weights are not normalised in advance
 }
 
+__global__ void nlm_pad(const float* in, float* out, int S, int P, float h, float sigma_n, int W, int H)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= W || v >= H) return;
+
+    int R = S + P;
+    int stride = W + 2 * R;                          // padded row length
+    const float* p = in + (v + R) * stride + (u + R);
+
+    float bias = 2.0f * sigma_n * sigma_n;
+    float inv_h2 = 1.0f / (h * h);
+    float inv_T2 = 1.0f / float((2 * P + 1) * (2 * P + 1));
+
+    float sum = 0.0f, total = 0.0f;
+    for (int dj = -S; dj <= S; ++dj)
+    for (int di = -S; di <= S; ++di)
+    {
+        const float* q = p + dj * stride + di;
+        float d2 = 0.0f;
+        for (int kj = -P; kj <= P; ++kj)
+        {
+            const float* ra = p + kj * stride;       // row pointers replace va, vb
+            const float* rb = q + kj * stride;
+            for (int ki = -P; ki <= P; ++ki)
+            {
+                float e = ra[ki] - rb[ki];
+                d2 += e * e;
+            }
+        }
+        float wq = expf(-max(d2 * inv_T2 - bias, 0.0f) * inv_h2);
+        sum += wq * q[0];
+        total += wq;
+    }
+    out[v * W + u] = sum / total;
+}
+
+__device__ float row_sum(const float* a, int d, int P)
+{
+    float s = 0.0f;
+    for (int ki = -P; ki <= P; ++ki)
+    {
+        float e = a[ki] - a[ki + d];
+        s += e * e;
+    }
+    return s;
+}
+
+__global__ void nlm_box(const float* pad, float* out, int S, int P, float h, float sigma_n, int W, int H)
+{
+    __shared__ float tmp[s_box_block * (s_box_block + 2 * s_P)];   // rows -P .. block + P
+
+    int B = blockDim.x;
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int u = blockIdx.x * B + tx;
+    int v = blockIdx.y * B + ty;
+
+    int R = S + P;
+    int stride = W + 2 * R;
+    const float* a = pad + (v + R) * stride + (u + R);
+
+    float bias = 2.0f * sigma_n * sigma_n;
+    float inv_h2 = 1.0f / (h * h);
+    float inv_T2 = 1.0f / float((2 * P + 1) * (2 * P + 1));
+
+    float sum = 0.0f, total = 0.0f;                  // registers, not global buffers
+    for (int dj = -S; dj <= S; ++dj)
+    for (int di = -S; di <= S; ++di)
+    {
+        int d = dj * stride + di;
+
+        if (u < W)                                   // the top and bottom P rows have no threads of their own
+        {
+            if (v < H + P)            tmp[(ty + P) * B + tx]     = row_sum(a, d, P);
+            if (ty < P)               tmp[ty * B + tx]           = row_sum(a - P * stride, d, P);
+            if (ty >= B - P && v < H) tmp[(ty + 2 * P) * B + tx] = row_sum(a + P * stride, d, P);
+        }
+        __syncthreads();                             // readers see every row of this offset
+
+        if (u < W && v < H)
+        {
+            const float* t = tmp + (ty + P) * B + tx;
+            float d2 = 0.0f;
+            for (int kj = -P; kj <= P; ++kj) d2 += t[kj * B];
+            float wq = expf(-max(d2 * inv_T2 - bias, 0.0f) * inv_h2);
+            sum += wq * a[d];
+            total += wq;
+        }
+        __syncthreads();                             // next offset must not overwrite rows still in use
+    }
+    if (u < W && v < H) out[v * W + u] = sum / total;
+}
+
+std::vector<float> pad_clamp(const std::vector<float>& in, int W, int H, int R)
+{
+    int sw = W + 2 * R, sh = H + 2 * R;
+    std::vector<float> out(size_t(sw) * sh);
+    for (int y = 0; y < sh; ++y)
+    for (int x = 0; x < sw; ++x)
+    {
+        int yc = std::min(std::max(y - R, 0), H - 1);
+        int xc = std::min(std::max(x - R, 0), W - 1);
+        out[size_t(y) * sw + x] = in[size_t(yc) * W + xc];
+    }
+    return out;
+}
+
+using Clock = std::chrono::steady_clock;
+
+double ms_since(Clock::time_point t0)
+{
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+}
+
+void compare_pad(int W, int H)
+{
+
+    const int warmup = 3, runs = 11;
+    const dim3 block(32, 32);
+
+    std::vector<float> h(size_t(W) * H);
+    std::mt19937 rng(1234);
+    std::normal_distribution<float> noise(0.5f, s_sigma_n);
+    for (float& x : h) x = noise(rng);
+    std::vector<float> hp = pad_clamp(h, W, H, s_S + s_P);
+
+    size_t bytes = h.size() * sizeof(float), bytes_p = hp.size() * sizeof(float);
+    float* d_in = nullptr; float* d_pad = nullptr; float* d_a = nullptr; float* d_b = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_in, bytes));
+    CUDA_CHECK(cudaMalloc(&d_pad, bytes_p));
+    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, bytes));
+    CUDA_CHECK(cudaMemcpy(d_in, h.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pad, hp.data(), bytes_p, cudaMemcpyHostToDevice));
+
+    dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
+    auto clamped = [&]() {
+        nlm<<<grid, block>>>(d_in, d_a, s_S, s_P, s_h, s_sigma_n, W, H);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    };
+    auto padded = [&]() {
+        nlm_pad<<<grid, block>>>(d_pad, d_b, s_S, s_P, s_h, s_sigma_n, W, H);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    };
+
+    for (int r = 0; r < warmup; ++r) { clamped(); padded(); }
+    std::vector<double> ratio(runs);
+    for (int r = 0; r < runs; ++r)
+    {
+        auto t0 = Clock::now(); clamped(); double ta = ms_since(t0);
+        t0 = Clock::now(); padded(); ratio[r] = ms_since(t0) / ta;
+    }
+
+    std::vector<float> a(h.size()), b(h.size());
+    CUDA_CHECK(cudaMemcpy(a.data(), d_a, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(b.data(), d_b, bytes, cudaMemcpyDeviceToHost));
+    double diff = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) diff = std::fmax(diff, std::fabs(double(a[i]) - b[i]));
+
+    std::sort(ratio.begin(), ratio.end());
+    printf("%4dx%-4d padded/clamped median %.3f  min %.3f  max %.3f  max diff %.2e\n",
+        W, H, ratio[runs / 2], ratio[0], ratio[runs - 1], diff);
+
+    CUDA_CHECK(cudaFree(d_in)); CUDA_CHECK(cudaFree(d_pad));
+    CUDA_CHECK(cudaFree(d_a)); CUDA_CHECK(cudaFree(d_b));
+}
+
+void compare_box(int W, int H)
+{
+    const int warmup = 3, runs = 11;
+    const dim3 block(s_box_block, s_box_block);
+
+    std::vector<float> h(size_t(W) * H);
+    std::mt19937 rng(1234);
+    std::normal_distribution<float> noise(0.5f, s_sigma_n);
+    for (float& x : h) x = noise(rng);
+    std::vector<float> hp = pad_clamp(h, W, H, s_S + s_P);
+
+    size_t bytes = h.size() * sizeof(float), bytes_p = hp.size() * sizeof(float);
+    float* d_pad = nullptr; float* d_a = nullptr; float* d_b = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_pad, bytes_p));
+    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, bytes));
+    CUDA_CHECK(cudaMemcpy(d_pad, hp.data(), bytes_p, cudaMemcpyHostToDevice));
+
+    dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
+    auto padded = [&]() {
+        nlm_pad<<<grid, block>>>(d_pad, d_a, s_S, s_P, s_h, s_sigma_n, W, H);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    };
+    auto box = [&]() {
+        nlm_box<<<grid, block>>>(d_pad, d_b, s_S, s_P, s_h, s_sigma_n, W, H);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    };
+
+    for (int r = 0; r < warmup; ++r) { padded(); box(); }
+    std::vector<double> ratio(runs);
+    for (int r = 0; r < runs; ++r)
+    {
+        auto t0 = Clock::now(); padded(); double ta = ms_since(t0);
+        t0 = Clock::now(); box(); ratio[r] = ms_since(t0) / ta;
+    }
+
+    std::vector<float> a(h.size()), b(h.size());
+    CUDA_CHECK(cudaMemcpy(a.data(), d_a, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(b.data(), d_b, bytes, cudaMemcpyDeviceToHost));
+    double diff = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) diff = std::fmax(diff, std::fabs(double(a[i]) - b[i]));
+
+    std::sort(ratio.begin(), ratio.end());
+    printf("%4dx%-4d box/pad median %.3f  min %.3f  max %.3f  max diff %.2e\n",
+        W, H, ratio[runs / 2], ratio[0], ratio[runs - 1], diff);
+
+    CUDA_CHECK(cudaFree(d_pad)); CUDA_CHECK(cudaFree(d_a)); CUDA_CHECK(cudaFree(d_b));
+}
+
 std::vector<float> filter_nlm(const ImageD& y, dim3 block)
 {
     std::vector<float> in(y.data.size());
@@ -74,13 +291,6 @@ std::vector<float> filter_nlm(const ImageD& y, dim3 block)
     CUDA_CHECK(cudaFree(d_in));
     CUDA_CHECK(cudaFree(d_out));
     return out;
-}
-
-using Clock = std::chrono::steady_clock;
-
-double ms_since(Clock::time_point t0)
-{
-    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
 
 void time_nlm(int W, int H, dim3 block)
@@ -109,7 +319,7 @@ void time_nlm(int W, int H, dim3 block)
     std::vector<double> t(runs);
     for (int r = 0; r < runs; ++r)
     {
-        auto t0 = Clock::now();
+        auto t0 = std::chrono::steady_clock::now();
         launch();
         t[r] = ms_since(t0);
     }
@@ -141,4 +351,7 @@ int main()
 
     time_nlm(256, 256, block);
     time_nlm(2048, 2048, block);
+
+    compare_pad(2048, 2048);
+    compare_box(2048, 2048);
 }
