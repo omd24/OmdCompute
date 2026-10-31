@@ -243,8 +243,55 @@ $k$: launches (direct 1, separable 2). $t_0$: fixed cost per launch. $c$: cost p
 | Speed-up stays below the tap ratio (8.5 against 12.5) | Same fixed cost; separable also performs one additional image write |
 | CPU wait and GPU time agree to 0.006 ms at 2048×2048 | CPU-side launch and synchronisation overhead is small at this size |
 | At 256×256, separable GPU time exceeds CPU wait | Probably the cost of the additional event between passes; not verified |
-| `blur_v` is not slower than `blur_h` | Row-crossing reads carry no visible penalty at these sizes; cause not established |
+| `blur_v` is not slower than `blur_h` | Row-crossing reads carry no visible penalty at these sizes; see [Nsight Compute](#nsight-compute) |
 | Transfers exceed the separable filter time at 2048×2048 | Per-frame readback would dominate this workload |
+
+## Profiling
+
+Launch settings for Nsight Systems and Nsight Compute, with `<repo>` as the absolute repository path:
+
+| Field | Value |
+|---|---|
+| Command line | `"<repo>\experiments\pc\01-cuda-filtering\CudaFiltering\x64\Release\GaussianFilter.exe"` |
+| Working directory | `<repo>\experiments\pc\01-cuda-filtering\CudaFiltering\GaussianFilter` |
+
+The working directory is required: `GaussianFilter` resolves the `.npy` root relative to it.
+
+### Nsight Systems
+
+Laptop GPU, Release, kernels and API calls traced.
+
+| 256×256, median | Time |
+|---|---|
+| `blur_h`, kernel execution | 1.4 µs |
+| `blur_v`, kernel execution | 1.5 µs |
+| One pass, GPU time from events | 8 to 9 µs |
+| `cudaLaunchKernel`, CPU call under tracing | 6 to 8 µs |
+
+Most of the fixed cost lies outside kernel execution. Idle GPU time during the CPU launch call is a candidate cause; not verified.
+
+### Nsight Compute
+
+Profile activity, metric set `full`, one kernel per report. Launch skip 1489 and launch count 1 select a warmed launch at 2048×2048, $\sigma = 4$.
+
+Durations are not comparable with the Timing section: the profiler reported an SM clock of 1.55 to 1.59 GHz.
+
+<img src="figures/nsight_summary.png" width="640">
+
+Counter checks, with $2048^2 / 32 = 131072$ warps: `gaussian_direct` fused FP32 instructions = 625 × 131072; `blur_v` loads = 50 × 131072 (25 image, 25 weights), stores = 131072.
+
+| Observation | Interpretation |
+|---|---|
+| `gaussian_direct`: L1 hit rate 99.5%, memory pipes 88% busy | Limited by load issue rate, not by cache misses |
+| LG throttle is the largest stall and LSU the busiest pipe | Load and store issue, not arithmetic, limits throughput |
+| `blur_v`: 6.67 active warps per scheduler, 1.67 eligible | Most warps are waiting |
+| `blur_v` is 17.6% slower than `blur_h` under the profiler, but not in the Timing section | L2 hit rate 27% against 33%, with about one full image read from device memory. In the application the input is probably already in L2; not verified |
+| Half of the `blur_v` loads read weights | The weights contribute to load pressure |
+| Theoretical occupancy is 66.7% (8 of 12 warps) for all three kernels | Limited by registers and warps per block; the 32×32 block occupies 32 warps |
+
+## Known limitations
+
+These results form the unoptimised baseline. Block size and shared memory variants have not been evaluated.
 
 ## Environment
 
