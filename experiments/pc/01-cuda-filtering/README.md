@@ -69,7 +69,7 @@ Laptop GPU, $n = 1024$, block 256.
 
 Filter definition, boundary handling and test data: [00 — Image baseline](../00-image-baseline/README.md).
 
-$$\hat{x}[v,u] = \sum_{j=-R}^{R}\sum_{i=-R}^{R} w_j\, w_i\; y\big[c_v(v+j),\, c_u(u+i)\big], \qquad R = \lceil 3\sigma \rceil$$
+$$\hat{x}[v,u] = \sum_{j=-R}^{R}\sum_{i=-R}^{R} w_j w_i \cdot y\big[c_v(v+j), c_u(u+i)\big], \qquad R = \lceil 3\sigma \rceil$$
 
 Inputs: noisy images ($\sigma_n = 0.1$), 256×256 and 257×129. Non-square size exposes swapped-axis errors.
 
@@ -111,7 +111,7 @@ out[v * W + u] = sum
 
 ### Results
 
-$\max|\hat{x}_{\text{CUDA, float32}} - \hat{x}_{\text{reference, float64}}|$, laptop GPU, Release, 16 cases.
+`max |CUDA (float32) − reference (float64)|`, laptop GPU, Release, 16 cases.
 
 | Pattern, size | $\sigma = 0.5$ | $\sigma = 1$ | $\sigma = 2$ | $\sigma = 4$ |
 |---|---|---|---|---|
