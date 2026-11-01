@@ -1,5 +1,6 @@
 # Private notes and per-machine settings - not tracked
 /local/
+CLAUDE.md
 CLAUDE.local.md
 .claude/settings.local.json
 

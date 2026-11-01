@@ -35,10 +35,9 @@ Phone memory is shared between CPU and GPU and is not all available to one appli
 
 ### Workflow
 
-- **Discussion and implementation** both take place in Claude Code sessions opened in this repository, so theory discussions can refer to the actual code, logs and images. Every discussion ends with a written outcome (learning note, decision record or README update).
-- **Laptop sessions** (desk or phone via Remote Control) are the default, as nearly all work needs the CUDA GPU. The laptop must be running and awake.
-- **Cloud sessions** are limited to CPU-only work: documentation, CPU references, tests. They have no access to the CUDA GPU or the phone.
-- **Phone deployment** uses ADB wireless debugging from the laptop: APKs are installed, launched and their logs collected by the laptop session. Mobile GPU/NPU results come only from the installed app.
+- **Laptop** is the default execution target, as nearly all work needs the CUDA GPU.
+- **Cloud CPU** is limited to CPU-only work: documentation, CPU references, tests. It has no access to the CUDA GPU or the phone.
+- **Phone deployment** uses ADB wireless debugging from the laptop: APKs are installed, launched and their logs collected from the laptop. Mobile GPU/NPU results come only from the installed app.
 - **Linux host:** CUDA and PyTorch are used natively on Windows. A WSL2 Ubuntu environment is added if and when the Qualcomm/LiteRT NPU toolchain requires it.
 
 ## 4. Structure
@@ -142,9 +141,9 @@ The NPU is reached through a supported runtime/compiler (e.g. LiteRT with Qualco
 3. **Implement:** minimal change; run whatever the current environment genuinely supports.
 4. **Run on target hardware:** laptop for CUDA work, installed app for mobile GPU/NPU work. Unexecuted tests are labelled.
 5. **Interpret:** relate results to theory and choose the next step.
-6. **Checkpoint:** experiment README, learning notes, decision records and the status table are updated.
+6. **Checkpoint:** the experiment README and the status table are updated.
 
-Every result is written up using [docs/report-template.md](docs/report-template.md).
+Every result is written up in the experiment README.
 
 ## 8. Resources
 
@@ -167,8 +166,6 @@ Resources are consulted when a milestone needs them, starting from official docu
 | [LiteRT NPU](https://developers.google.com/edge/litert/next/npu) | NPU compilation/deployment |
 | [LiteRT Qualcomm](https://developers.google.com/edge/litert/next/qualcomm) | Supported SoCs, host requirements |
 | [Qualcomm AI Hub](https://aihub.qualcomm.com/) | Reference models (hosted results are not measurements of this device) |
-| [Claude Code Remote Control](https://code.claude.com/docs/en/remote-control) | Phone-directed laptop sessions |
-| [Claude Code on the web](https://code.claude.com/docs/en/claude-code-on-the-web) | Cloud (CPU-only) sessions |
 
 ## 9. Repository policy
 

@@ -32,7 +32,6 @@ Each experiment is a bounded, self-contained investigation with a stated questio
 ## Layout
 
 ```
-docs/            context, learning notes, decision records, report template
 experiments/     pc/ (numbered series) and mobile/ (independent menu)
 fixtures/        small shared test images or their generation recipes
 reports/         selected images, tables and conclusions
