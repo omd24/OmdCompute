@@ -17,8 +17,9 @@ A compact residual CNN, trained in PyTorch on natural photographs with synthetic
 ```bash
 python -m venv .venv                 # then activate .venv
 pip install torch --index-url https://download.pytorch.org/whl/cu134
-pip install numpy matplotlib pillow
+pip install numpy matplotlib pillow pytest
 python prepare.py                    # once, after downloading DIV2K into data/
+python -m pytest                     # correctness tests; DIV2K tests skip without data/gray/
 python train.py                      # writes runs/depth13/: config.json, curve.csv, model.pt
 python plot.py                       # writes runs/depth13/curve.png
 ```
@@ -121,16 +122,22 @@ save w
 
 ## Correctness
 
+`tests/test_denoiser.py`, 10 tests, all passing on the laptop (3.3 s):
+
 | Check | Result |
 |---|---|
 | sRGB to linear at 0, 0.04045, 0.5, 1 against the standard | Within 1e-5 |
 | Luma of uniform white, red and green images | 1, 0.2126, 0.7152 |
 | Stored `.npy` against a fresh PNG decode, first and last image of each split | Identical |
-| Training images in [0, 1], finite | Pass, 800 images |
 | Train and validation file names | Disjoint, 800 / 100 |
-| Added noise on the GPU | Mean −0.000031, standard deviation 0.100034 |
+| Patch of an image with unique pixel values against the source window | Identical |
+| Added noise, 262,144 samples | Mean and standard deviation within 1e-3 of 0 and 0.1; redrawn per call |
 | Parameter count against the formula | 408,128 |
-| Receptive field from the gradient of one output pixel, depth 5 / 13 / 17 | 11 / 27 / 35 |
+| Output size follows input, 64×64 and 128×300 | Pass |
+| Receptive field from the gradient of one output pixel, depth 5 / 13 | 11 / 27 |
+| Last layer zeroed, so f(y) = 0 | Output equals input |
+
+Measured once outside the tests: all 800 training images lie in [0, 1] and are finite; noise on a training batch has mean −0.000031 and standard deviation 0.100034; depth 17 has a 35×35 receptive field.
 
 ## Results
 
@@ -155,4 +162,4 @@ Validation PSNR was still rising at epoch 100. The comparison with Gaussian and 
 
 ## Environment
 
-NVIDIA GeForce RTX 5090 Laptop GPU (`sm_120`), driver 621.01, Windows 11. Python 3.13.5, PyTorch 2.15.0+cu134 (CUDA 13.4 runtime, cuDNN 9.26), NumPy 2.5.4, Matplotlib 3.11.2, Pillow 13.0.0.
+NVIDIA GeForce RTX 5090 Laptop GPU (`sm_120`), driver 621.01, Windows 11. Python 3.13.5, PyTorch 2.15.0+cu134 (CUDA 13.4 runtime, cuDNN 9.26), NumPy 2.5.4, Matplotlib 3.11.2, Pillow 13.0.0, pytest 9.2.0.
