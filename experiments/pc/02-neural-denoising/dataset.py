@@ -1,4 +1,6 @@
 """Random clean patches from the prepared images. Noise is added on the GPU."""
+## hands out random clean patches; add_noise makes the noisy input
+
 from pathlib import Path
 
 import numpy as np

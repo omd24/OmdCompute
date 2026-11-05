@@ -1,4 +1,6 @@
 """Converts the DIV2K PNG images to linear one-channel float32 .npy files."""
+##  PNG to linear grey .npy, run once
+
 from pathlib import Path
 
 import numpy as np
