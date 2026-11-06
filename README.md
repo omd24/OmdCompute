@@ -34,6 +34,7 @@ Each experiment is a bounded, self-contained investigation with a stated questio
 ```
 experiments/     pc/ (numbered series) and mobile/ (independent menu)
 fixtures/        small shared test images or their generation recipes
+tools/           measurement utilities (D3D12StablePower: fixed GPU clock for timing)
 reports/         selected images, tables and conclusions
 ```
 

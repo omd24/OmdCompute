@@ -1,0 +1,2 @@
+//device buffer + NHWC shape
+

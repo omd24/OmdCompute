@@ -10,9 +10,11 @@ A compact residual CNN, trained in PyTorch on natural photographs with synthetic
 | `dataset.py` | Random clean patches, noise added on the GPU | Done |
 | `model.py` | DnCNN-style residual denoiser | Done |
 | `train.py`, `plot.py` | Training loop, validation curve | Done |
-| Evaluation | Comparison with noisy input, Gaussian and NLM on held-out images | Pending |
-| Inference | Model size, inference time, failure cases | Pending |
-| CUDA inference | Hand-written CUDA forward pass, compared with PyTorch | Pending |
+| `profile_step.py` | Nsight Systems capture of training steps | Done |
+| `export_weights.py`, `CudaNeuralDenoising/Inference` | Hand-written CUDA forward pass, compared with PyTorch | Naive version done |
+| `CudaNeuralDenoising/Training` | Hand-written CUDA training step | Pending |
+| Evaluation | Comparison with noisy input, Gaussian and NLM on a test set not used in training | Pending |
+| Inference study | Model size, inference time, failure cases | Pending |
 
 ```bash
 python -m venv .venv                 # then activate .venv
@@ -22,6 +24,9 @@ python prepare.py                    # once, after downloading DIV2K into data/
 python -m pytest                     # correctness tests; DIV2K tests skip without data/gray/
 python train.py                      # writes runs/depth13/: config.json, curve.csv, model.pt
 python plot.py                       # writes runs/depth13/curve.png
+nsys profile --capture-range=cudaProfilerApi --trace=cuda,nvtx,cuDNN -o runs/profile_step python profile_step.py
+python export_weights.py             # writes runs/depth13/export/: folded weights, test input, PyTorch output
+# then build CudaNeuralDenoising/CudaNeuralDenoising.sln (Release x64) and run it from runs/depth13/
 ```
 
 ## Problem
@@ -158,8 +163,86 @@ Laptop GPU, one training run with the settings above.
 | Loading the training set into RAM | 13.5 s |
 | Data loading, noise and transfer, one epoch without the model | 0.31 s |
 
-Validation PSNR was still rising at epoch 100. The comparison with Gaussian and NLM on the same images is pending.
+Validation PSNR was still rising at epoch 100. The comparison with Gaussian and NLM on a test set is pending.
+
+## Training profile
+
+`profile_step.py`: one fixed batch of 32 random 64×64 patches already on the GPU (data loading measured separately: under 1 ms per step), 20 warm-up steps, then 10 steps captured with Nsight Systems. Kernel times from `nsys stats --report cuda_gpu_trace --format csv`.
+
+<img src="figures/training_step_profile.png" width="720">
+
+| Quantity per step | Value |
+|---|---|
+| Kernels | 258 |
+| GPU busy / span | 21.4 / 22.6 ms (95%) |
+| NCHW↔NHWC transposes | 106 launches |
+| Convolution work, forward + backward | ≈ 320 GFLOP, ≈ 29 TFLOP/s achieved |
+
+The GPU is idle 5% of the step, so host-side launch overhead is not the limit. The convolutions run on TF32 tensor cores (`s1688fprop/dgrad_…_tf32`); the 1-channel first and last layers use FP32 kernels without tensor cores (`implicit_convolve_sgemm`, `wgrad_alg0_engine`). 42% of the kernel time is spent in passes that only move data:
+
+| Extra pass | Cause | Share |
+|---|---|---|
+| Layout transposes | PyTorch stores NCHW, the tensor-core kernels use NHWC | 18% |
+| BatchNorm | Separate read and write of every activation, forward and backward | 15% |
+| Replicate padding | cuDNN convolutions pad with zeros only; clamp padding is a separate copy | 9% |
+
+A fused implementation (NHWC throughout, clamp addressing inside the convolution, normalisation and ReLU applied in the convolution epilogue) removes these passes.
+
+## CUDA inference
+
+At inference, BatchNorm uses fixed running statistics and reduces to a per-channel affine map, which is folded into the preceding convolution:
+
+$$s_k = \frac{\gamma_k}{\sqrt{v_k + \epsilon}}, \qquad w'_k = s_k w_k, \qquad b'_k = s_k (b_k - \mu_k) + \beta_k$$
+
+Each layer is then one kernel: clamp padding, 3×3 convolution, bias, ReLU. The last layer writes $\hat{x} = y - f(y)$ directly.
+
+```mermaid
+flowchart LR
+    A["model.pt"] --> B["export_weights.py: fold BN, KCRS → RSCK"]
+    B --> C["export/convNN_w.npy, convNN_b.npy"]
+    C --> D["conv3x3 × 13, ping-pong buffers a, b"]
+    Y["y, 1 channel"] --> D
+    D --> X["x̂ = y − f(y)"]
+```
+
+```
+conv3x3, one thread per output value (pixel p = (u, v), output channel k):
+    acc = b[k]
+    for r, s in 3×3:                                    # clamp addressing, no padded copy
+        x = in[clamp(v + r − 1), clamp(u + s − 1), :]   # NHWC: C channels contiguous
+        acc += Σ_c w[r, s, c, k] · x[c]                 # RSCK: k contiguous
+    out[p, k] = relu(acc)            or, last layer: y[p] − acc
+```
+
+### Memory layout
+
+<img src="figures/memory_layouts.png" width="720">
+
+Consecutive threads of a warp hold consecutive output channels $k$ of one pixel. The input value $x_c$ is then the same address for the whole warp (broadcast). The weight read is one coalesced transaction with $k$ fastest (RSCK), or 32 separate transactions with $k$ slowest (KRSC), where neighbouring threads are $9C$ floats apart.
+
+### Correctness
+
+| Check | Result |
+|---|---|
+| Folded network (PyTorch ops, float64) against the trained model, 256² crop | max abs 2.28e-7 |
+| CUDA forward pass against the PyTorch model output, same crop | max abs 7.15e-7 |
+
+The test input is the 256×256 centre crop of validation image 0801 with fixed noise (seed 0).
+
+### Timing
+
+Forward pass of the whole network, GPU time from CUDA events per pass, minimum of 50 (256²) or 9 (2048²) passes after at least 1 s / 3 s of warm-up. `Inference` itself prints the mean of 20 / 5 passes after one warm-up pass (2622 and 2626 ms at 2048² in two runs in stable power state). The GPU is held in D3D12 stable power state ([D3D12StablePower](../../../tools/D3D12StablePower/), SM clock 930–1080 MHz), and all rows were measured in one session.
+
+| Implementation | 256² | 2048² | 2048², relative to PyTorch |
+|---|---|---|---|
+| PyTorch, cuDNN, eval mode | 6.80 ms | 696 ms | 1.0 |
+| CUDA naive, RSCK weights | 41.7 ms | 3106 ms | 4.5 |
+| CUDA naive, KRSC weights | 352.8 ms | 23265 ms | 33.4 |
+
+The weight layout alone accounts for a factor of 7.5 at 2048² (KRSC against RSCK).
+
+The network performs ≈ 0.81 MFLOP per pixel ($11 \cdot 9 \cdot 64^2$ multiply-adds in the middle layers), 3.4 TFLOP per 2048² image.
 
 ## Environment
 
-NVIDIA GeForce RTX 5090 Laptop GPU (`sm_120`), driver 621.01, Windows 11. Python 3.13.5, PyTorch 2.15.0+cu134 (CUDA 13.4 runtime, cuDNN 9.26), NumPy 2.5.4, Matplotlib 3.11.2, Pillow 13.0.0, pytest 9.2.0.
+NVIDIA GeForce RTX 5090 Laptop GPU (`sm_120`), driver 621.01, Windows 11. Python 3.13.5, PyTorch 2.15.0+cu134 (CUDA 13.4 runtime, cuDNN 9.26), NumPy 2.5.4, Matplotlib 3.11.2, Pillow 13.0.0, pytest 9.2.0. CUDA 13.4, Visual Studio 2022, Nsight Systems 2026.5.1.

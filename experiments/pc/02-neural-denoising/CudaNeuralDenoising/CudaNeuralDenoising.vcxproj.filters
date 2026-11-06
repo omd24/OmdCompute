@@ -1,0 +1,42 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Common">
+      <UniqueIdentifier>{145f5f53-3b7e-409f-b3ee-9d0ce50be962}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Inference">
+      <UniqueIdentifier>{ce01f65d-41f5-445c-a6ba-4e3caaf0a473}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Training">
+      <UniqueIdentifier>{ab2c099d-3797-4692-bf82-659d027287ed}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <CudaCompile Include="Inference\inference.cu">
+      <Filter>Inference</Filter>
+    </CudaCompile>
+    <CudaCompile Include="Training\training.cu">
+      <Filter>Training</Filter>
+    </CudaCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Training\adam.cuh">
+      <Filter>Training</Filter>
+    </ClInclude>
+    <ClInclude Include="Training\backward.cuh">
+      <Filter>Training</Filter>
+    </ClInclude>
+    <ClInclude Include="Common\check.h">
+      <Filter>Common</Filter>
+    </ClInclude>
+    <ClInclude Include="Common\conv3x3.cuh">
+      <Filter>Common</Filter>
+    </ClInclude>
+    <ClInclude Include="Common\npy.h">
+      <Filter>Common</Filter>
+    </ClInclude>
+    <ClInclude Include="Common\tensor.h">
+      <Filter>Common</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>
