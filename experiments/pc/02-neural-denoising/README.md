@@ -243,6 +243,41 @@ The weight layout alone accounts for a factor of 7.5 at 2048² (KRSC against RSC
 
 The network performs ≈ 0.81 MFLOP per pixel ($11 \cdot 9 \cdot 64^2$ multiply-adds in the middle layers), 3.4 TFLOP per 2048² image.
 
+### Register blocking
+
+The naive kernel issues two loads per FMA. `conv3x3_blocked<C, K, TP, TK>` (middle 64→64 layers) gives each thread a tile of TP = 4 consecutive pixels × TK = 8 output channels, held in 32 accumulator registers. Each (tap, input channel) step is then an outer product of 4 inputs and 8 weights: 12 loads feed 32 FMAs.
+
+<img src="figures/register_blocking.png" width="720">
+
+```
+conv3x3_blocked, one thread per (row v, pixels u0 … u0+3, channels k0 … k0+7):
+    acc[4][8] = b[k0 … k0+7]
+    for r in 0..2:
+        for c in 0..C step 4:
+            x[0..5] = float4 in[clamp(v + r − 1), clamp(u0 − 1 … u0 + 4), c … c+3]
+            for s in 0..2, cc in 0..3:
+                wk[0..7] = 2 × float4 w[r, s, c + cc, k0 … k0+7]
+                acc[j][k] += x[j + s][cc] · wk[k]      for j < 4, k < 8
+    out[v, u0 + j, k0 + k] = relu(acc[j][k])          as float4
+```
+
+| Layer 1, 2048², Nsight Compute | Naive | Blocked |
+|---|---|---|
+| Cycles | 248.9M | 36.5M |
+| Instructions | 47.8G | 5.63G |
+| FP32 throughput, of peak | 6% | 40% |
+| Registers per thread / occupancy | 40 / 91% | 80 / 50% |
+| L1 hit / L2 hit | 97% / 95.7% | 93.2% / 66.7% |
+| Global load bytes used per 32-byte sector | | 15.9 |
+
+| Check / timing | Result |
+|---|---|
+| CUDA forward pass with blocked layers against PyTorch, 256² crop | max abs 8.79e-7 |
+| Blocked / naive whole pass, 256² | 0.219 (4.30 / 19.65 ms) |
+| Blocked / naive whole pass, 2048² | 0.162 (364 / 2256 ms) |
+
+Timings are minima over alternating naive / blocked passes in one run (20 pairs at 256², 4 at 2048²), without stable power state. The first and last layers (1 input or 1 output channel) remain naive.
+
 ## Environment
 
 NVIDIA GeForce RTX 5090 Laptop GPU (`sm_120`), driver 621.01, Windows 11. Python 3.13.5, PyTorch 2.15.0+cu134 (CUDA 13.4 runtime, cuDNN 9.26), NumPy 2.5.4, Matplotlib 3.11.2, Pillow 13.0.0, pytest 9.2.0. CUDA 13.4, Visual Studio 2022, Nsight Systems 2026.5.1.

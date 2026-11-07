@@ -1,7 +1,6 @@
-//load weights, forward pass, compare with PyTorch, time
-
 #include "../Common/check.h"
 #include "../Common/npy.h"
+#include "../Common/conv3x3.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +9,7 @@
 const std::string s_dir = "export/";
 const int s_layers = 13;
 const int s_features = 64;
+const int TP = 4, TK = 8;                            // pixels and output channels per thread in conv3x3_blocked
 
 struct Layer
 {
@@ -73,7 +73,7 @@ std::vector<Layer> load_layers()
 }
 
 // whole network; a and b are ping-pong buffers of W * H * features floats
-void forward(const std::vector<Layer>& layers, const float* y, float* x, float* a, float* b, int W, int H)
+void forward_naiive(const std::vector<Layer>& layers, const float* y, float* x, float* a, float* b, int W, int H)
 {
     const int block = 256;
     const float* in = y;
@@ -88,16 +88,40 @@ void forward(const std::vector<Layer>& layers, const float* y, float* x, float* 
     }
 }
 
+// whole network; a and b are ping-pong buffers of W * H * features floats
+void forward(const std::vector<Layer>& layers, const float* y, float* x, float* a, float* b, int W, int H, bool blocked)
+{
+    const int block = 256;
+    const float* in = y;
+    for (int i = 0; i < s_layers; ++i)
+    {
+        const Layer& L = layers[i];
+        bool last = i == s_layers - 1;
+        float* out = last ? x : (i % 2 == 0 ? a : b);
+        if (blocked && L.C == 64 && L.K == 64)
+        {
+            int n = (W + TP - 1) / TP * H * (64 / TK);
+            conv3x3_blocked<64, 64, TP, TK><<<(n + block - 1) / block, block>>>(in, L.w, L.b, out, W, H);
+        }
+        else
+        {
+            int n = W * H * L.K;
+            conv3x3<<<(n + block - 1) / block, block>>>(in, L.w, L.b, out, W, H, L.C, L.K, !last, last ? y : nullptr);
+        }
+        in = out;
+    }
+}
+
 // average GPU time of one forward pass, after one warm-up pass
-float time_forward(const std::vector<Layer>& layers, const float* y, float* x, float* a, float* b, int W, int H, int runs)
+float time_forward_naiive(const std::vector<Layer>& layers, const float* y, float* x, float* a, float* b, int W, int H, int runs)
 {
     cudaEvent_t t0, t1;
     CUDA_CHECK(cudaEventCreate(&t0));
     CUDA_CHECK(cudaEventCreate(&t1));
-    forward(layers, y, x, a, b, W, H);
+    forward_naiive(layers, y, x, a, b, W, H);
     CUDA_CHECK(cudaEventRecord(t0));
     for (int r = 0; r < runs; ++r)
-        forward(layers, y, x, a, b, W, H);
+        forward_naiive(layers, y, x, a, b, W, H);
     CUDA_CHECK(cudaEventRecord(t1));
     CUDA_CHECK(cudaEventSynchronize(t1));
     float ms;
@@ -105,6 +129,37 @@ float time_forward(const std::vector<Layer>& layers, const float* y, float* x, f
     CUDA_CHECK(cudaEventDestroy(t0));
     CUDA_CHECK(cudaEventDestroy(t1));
     return ms / runs;
+}
+
+// GPU time of one forward pass
+float time_once(const std::vector<Layer>& layers, const float* y, float* x, float* a, float* b, int W, int H, bool blocked)
+{
+    cudaEvent_t t0, t1;
+    CUDA_CHECK(cudaEventCreate(&t0));
+    CUDA_CHECK(cudaEventCreate(&t1));
+    CUDA_CHECK(cudaEventRecord(t0));
+    forward(layers, y, x, a, b, W, H, blocked);
+    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    float ms;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
+    CUDA_CHECK(cudaEventDestroy(t0));
+    CUDA_CHECK(cudaEventDestroy(t1));
+    return ms;
+}
+
+// naive and blocked alternate, so both see the same clock; min of each and the ratio of the minima
+void compare(const std::vector<Layer>& layers, const float* y, float* x, float* a, float* b, int W, int H, int pairs)
+{
+    time_once(layers, y, x, a, b, W, H, false);      // warm-up
+    time_once(layers, y, x, a, b, W, H, true);
+    float n = 1e30f, k = 1e30f;
+    for (int p = 0; p < pairs; ++p)
+    {
+        n = std::min(n, time_once(layers, y, x, a, b, W, H, false));
+        k = std::min(k, time_once(layers, y, x, a, b, W, H, true));
+    }
+    printf("%dx%d  naive %.3f ms  blocked %.3f ms  blocked/naive %.3f\n", W, H, n, k, k / n);
 }
 
 int main()
@@ -119,6 +174,8 @@ int main()
     CUDA_CHECK(cudaMalloc(&x, size_t(W) * H * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&a, size_t(W) * H * s_features * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b, size_t(W) * H * s_features * sizeof(float)));
+
+#if 0
     forward(layers, y, x, a, b, W, H);
     CUDA_CHECK(cudaGetLastError());
     std::vector<float> out(size_t(W) * H);
@@ -128,6 +185,22 @@ int main()
         err = std::max(err, double(std::fabs(out[i] - reference.data[i])));
     printf("%dx%d  max abs(cuda - pytorch) %.2e\n", W, H, err);
     printf("%dx%d  %.3f ms per forward pass\n", W, H, time_forward(layers, y, x, a, b, W, H, 20));
+
+#endif
+
+    for (int blocked = 0; blocked < 2; ++blocked)
+    {
+        forward(layers, y, x, a, b, W, H, blocked);
+        CUDA_CHECK(cudaGetLastError());
+        std::vector<float> out(size_t(W) * H);
+        CUDA_CHECK(cudaMemcpy(out.data(), x, out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        double err = 0.0;
+        for (size_t i = 0; i < out.size(); ++i)
+            err = std::max(err, double(std::fabs(out[i] - reference.data[i])));
+        printf("%dx%d  %s  max abs(cuda - pytorch) %.2e\n", W, H, blocked ? "blocked" : "naive  ", err);
+    }
+    compare(layers, y, x, a, b, W, H, 20);
+
     CUDA_CHECK(cudaFree(y)); CUDA_CHECK(cudaFree(x)); CUDA_CHECK(cudaFree(a)); CUDA_CHECK(cudaFree(b));
 
     // timing at 2048x2048; content does not change the cost
@@ -140,7 +213,7 @@ int main()
     CUDA_CHECK(cudaMalloc(&x, size_t(W) * H * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&a, size_t(W) * H * s_features * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b, size_t(W) * H * s_features * sizeof(float)));
-    printf("%dx%d  %.3f ms per forward pass\n", W, H, time_forward(layers, y, x, a, b, W, H, 5));
+    compare(layers, y, x, a, b, W, H, 4);
     CUDA_CHECK(cudaFree(y)); CUDA_CHECK(cudaFree(x)); CUDA_CHECK(cudaFree(a)); CUDA_CHECK(cudaFree(b));
     return 0;
 }

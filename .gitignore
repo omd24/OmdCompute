@@ -54,3 +54,4 @@ local.properties
 *.nsys-rep
 *.ncu-rep
 *.log
+*.ncu-repz
