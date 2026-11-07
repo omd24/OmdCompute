@@ -11,7 +11,7 @@ A compact residual CNN, trained in PyTorch on natural photographs with synthetic
 | `model.py` | DnCNN-style residual denoiser | Done |
 | `train.py`, `plot.py` | Training loop, validation curve | Done |
 | `profile_step.py` | Nsight Systems capture of training steps | Done |
-| `export_weights.py`, `CudaNeuralDenoising/Inference` | Hand-written CUDA forward pass, compared with PyTorch | Naive version done |
+| `export_weights.py`, `CudaNeuralDenoising/Inference` | Hand-written CUDA forward pass, compared with PyTorch | FP32 versions done: naive, register-blocked, shared-memory, double-buffered |
 | `CudaNeuralDenoising/Training` | Hand-written CUDA training step | Pending |
 | Evaluation | Comparison with noisy input, Gaussian and NLM on a test set not used in training | Pending |
 | Inference study | Model size, inference time, failure cases | Pending |
@@ -277,6 +277,84 @@ conv3x3_blocked, one thread per (row v, pixels u0 … u0+3, channels k0 … k0+7
 | Blocked / naive whole pass, 2048² | 0.162 (364 / 2256 ms) |
 
 Timings are minima over alternating naive / blocked passes in one run (20 pairs at 256², 4 at 2048²), without stable power state. The first and last layers (1 input or 1 output channel) remain naive.
+
+### Shared-memory tiling
+
+A tile is the piece of input data (and the matching weights) that one thread block copies into shared memory and reuses across its threads.
+
+`conv3x3_smem<C, K, TP, TK, PX, CC>`: one block of 128 threads covers PX = 64 pixels of one row and all 64 output channels (16 pixel tiles × 8 channel groups, same 4 × 8 thread tile as above). For each kernel row $r$ and chunk of CC = 16 input channels, the block stages the input segment (PX + 2 pixels) and the matching weights in shared memory with coalesced loads, then computes from shared memory.
+
+```
+conv3x3_smem, block = (row v, pixels ub … ub+63), thread = (tile, channel group g):
+    for r in 0..2, c0 in 0..C step CC:
+        xs[0..PX+1][CC]  = in[clamp(v + r − 1), clamp(ub − 1 … ub + PX), c0 … c0+CC−1]   # cooperative
+        ws[0..2][CC][K]  = w[r, 0..2, c0 … c0+CC−1, :]                                   # cooperative
+        barrier
+        outer products as in conv3x3_blocked, reading xs and ws
+        barrier
+```
+
+Shared memory has 32 banks of 4 bytes; a 128-bit load is served for 8 threads per pass, and threads addressing different words of one bank are serialised. With 8 contiguous output channels per thread, the weight reads of 8 neighbouring threads are 32 bytes apart and need two passes. Interleaving the channels (thread $g$ holds channels $4g … 4g+3$ and $32+4g … 32+4g+3$) makes the 8 reads contiguous.
+
+<img src="figures/shared_memory_banks.png" width="720">
+
+| Layer 1, 2048², Nsight Compute | Blocked | Smem, contiguous channels | Smem, interleaved channels |
+|---|---|---|---|
+| Cycles | 36.5M | 38.1M | 28.1M |
+| Load instructions (global / shared) | 380M / 0 | 28M / 377M | 28M / 377M |
+| Shared load wavefronts / bank conflicts | | 2.72G / 1.36G | 1.51G / 0.15G |
+| FMA pipe, of elapsed cycles | 49.9% | ≈ 48% | 66.9% |
+| Mem Busy | 91.7% | ≈ 96% | 77.2% |
+
+The shared-memory version issues as many load instructions as the blocked version; the gain comes from full 128-byte passes instead of half-used sectors. 1.51G wavefronts for 377M 128-bit loads is 4.0 per request, the minimum.
+
+| Check / timing | Result |
+|---|---|
+| CUDA forward pass with shared-memory layers against PyTorch, 256² crop | max abs 8.79e-7 |
+| Smem / blocked whole pass, contiguous channels, 256² / 2048² | 0.840 / 1.043 |
+| Smem / blocked whole pass, interleaved channels, 256² / 2048² | 0.653 / 0.931 |
+
+Timings as above: minima over alternating passes, without stable power state.
+
+### Asynchronous double buffering
+
+In `conv3x3_smem` about 80% of the sampled warp stalls fall on the staging step (weight copy 46.6%, input copy 25.9%, barrier 9.0%): a global load must return before its value can be stored to shared memory, and no FMAs run meanwhile. `conv3x3_async` keeps two shared buffers (`xs[2]`, `ws[2]`), each holding one tile, and copies chunk $q+1$ with `cp.async` (`__pipeline_memcpy_async`, global to shared memory without registers) while chunk $q$ is computed. The 12 chunks are $q = 4r + c_0/16$.
+
+<img src="figures/double_buffering.png" width="720">
+
+```
+conv3x3_async:
+    stage(0)                                   # cp.async into buffer 0, commit
+    for q in 0..11:
+        if q + 1 < 12: stage(q + 1)            # into buffer (q + 1) % 2
+        wait until chunk q has arrived         # __pipeline_wait_prior(1), or (0) for the last chunk
+        barrier
+        outer products from buffer q % 2
+        barrier                                # buffer q % 2 is refilled by stage(q + 2)
+```
+
+| Layer 1, 2048², Nsight Compute | Smem, interleaved channels | Async |
+|---|---|---|
+| Cycles | 28.8M | 26.9M |
+| Largest warp-stall location | weight copy, 46.6% | 9% |
+| Shared memory per block | 16.5 KB | 33.0 KB |
+| Registers per thread | 72 | 72 |
+
+| Check | Result |
+|---|---|
+| CUDA forward pass with async layers against PyTorch, 256² crop | max abs 8.79e-7 |
+| `compute-sanitizer --tool racecheck`, 256² pass | 0 hazards |
+
+### Comparison with PyTorch
+
+Whole forward pass, minimum of 50 (256²) or 9 (2048²) passes for PyTorch and of 20 / 4 alternating passes for CUDA; both measured twice, back to back in one session, without stable power state (SM clock ≈ 1.9 GHz). The CUDA pass uses `conv3x3_async` for the 11 middle layers and the naive kernel for the first and last layers.
+
+| Implementation | 256² | 2048² |
+|---|---|---|
+| PyTorch, cuDNN, eval mode | 2.93 / 3.13 ms | 330 / 332 ms |
+| CUDA, `conv3x3_async` | 2.79 / 2.81 ms | 218 / 220 ms |
+
+A middle layer performs 309 GFLOP at 2048²; 26.9M cycles at 1.41 GHz (19.1 ms) correspond to 16 TFLOP/s, about 55% of the FP32 FMA peak of $82 \cdot 128 \cdot 2 \cdot 1.41$ GHz ≈ 29.6 TFLOP/s. The cuDNN convolutions use TF32 tensor cores.
 
 ## Environment
 
